@@ -1,0 +1,32 @@
+environment: dev
+
+paths:
+  data_raw_dir: data/raw
+  data_processed_dir: data/processed
+  data_cache_dir: data/cache
+  duckdb_path: data/cache/metadata.duckdb
+  log_dir: logs
+
+ingestion:
+  default_timezone: Asia/Kolkata
+  default_resolution: 1min
+  allowed_resolutions:
+    - 1min
+    - 5min
+    - 15min
+    - 1h
+    - 1d
+  drop_duplicates_keep: last
+  missing_timestamp_fill: null
+  corruption_error_threshold: 0.02
+
+storage:
+  parquet_compression: zstd
+  parquet_row_group_size: 200000
+  partition_columns:
+    - feed
+    - date
+
+logging:
+  level: INFO
+  json: false

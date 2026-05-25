@@ -1,0 +1,64 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "trading-engine"
+version = "0.1.0"
+description = "Production-grade algorithmic trading framework for Indian markets"
+readme = "README.md"
+requires-python = ">=3.12"
+authors = [{ name = "Trading Engineering Team" }]
+dependencies = [
+  "pandas>=2.2.0",
+  "numpy>=1.26.0",
+  "scikit-learn>=1.5.0",
+  "vectorbt>=0.27.0",
+  "backtrader>=1.9.78.123",
+  "pyarrow>=16.0.0",
+  "duckdb>=1.0.0",
+  "sqlalchemy>=2.0.0",
+  "fastapi>=0.111.0",
+  "loguru>=0.7.2",
+  "pydantic>=2.8.0",
+  "pydantic-settings>=2.3.0",
+  "PyYAML>=6.0.1"
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.2.0",
+  "pytest-asyncio>=0.23.7",
+  "pytest-cov>=5.0.0",
+  "ruff>=0.5.0",
+  "mypy>=1.10.0"
+]
+
+[project.scripts]
+te-ingest = "trading_engine.cli.ingest:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "N", "C4", "SIM"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_unused_configs = true
+warn_return_any = true
+warn_unused_ignores = true
