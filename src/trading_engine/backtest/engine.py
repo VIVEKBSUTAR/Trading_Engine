@@ -35,11 +35,17 @@ class DirectionalSignalStrategy(bt.Strategy):
 		("confidence_threshold", 0.60),
 		("stop_loss_pct", 0.005),
 		("max_holding_bars", 20),
+		("commission", 0.0002),
+		("slippage_perc", 0.0005),
 	)
 
 	def __init__(self) -> None:
 		self._entry_bar = None
 		self._entry_price = None
+		self._entry_size = 0
+		self._pending_order = None
+		# ledger of executed trades with detailed accounting
+		self.trades: list[dict] = []
 
 	def next(self) -> None:
 		confidence = float(self.data.confidence[0])
@@ -52,31 +58,84 @@ class DirectionalSignalStrategy(bt.Strategy):
 				return
 
 			if signal_long == 1:
-				self.buy()
+				# place market order and store tentative entry info; actual price
+				# is recorded at the time of close (we assume immediate fill at close)
 				self._entry_bar = len(self)
 				self._entry_price = close_price
+				self._entry_size = 1
+				self.buy()
 				return
 
 			if signal_short == 1:
-				self.sell()
 				self._entry_bar = len(self)
 				self._entry_price = close_price
+				self._entry_size = 1
+				self.sell()
 				return
 
 		if self.position and self._entry_bar is not None and self._entry_price is not None:
 			holding_bars = len(self) - self._entry_bar
 			if holding_bars >= self.params.max_holding_bars:
-				self.close()
+				# compute exit accounting before closing
+				self._record_and_close(exit_price=close_price)
 				return
 
 			if self.position.size > 0:
 				stop_price = self._entry_price * (1.0 - self.params.stop_loss_pct)
 				if close_price <= stop_price:
-					self.close()
+					self._record_and_close(exit_price=close_price)
 			else:
 				stop_price = self._entry_price * (1.0 + self.params.stop_loss_pct)
 				if close_price >= stop_price:
-					self.close()
+					self._record_and_close(exit_price=close_price)
+
+	def _record_and_close(self, *, exit_price: float) -> None:
+		"""Record trade details applying conservative slippage and commission, then close position."""
+		if not self.position:
+			return
+
+		direction = "long" if self.position.size > 0 else "short"
+		size = abs(self.position.size) if hasattr(self.position, "size") else getattr(self, "_entry_size", 1)
+		entry_price = float(self._entry_price) if self._entry_price is not None else exit_price
+		exit_price = float(exit_price)
+
+		# gross pnl before costs
+		if direction == "long":
+			gross_pnl = (exit_price - entry_price) * size
+		else:
+			gross_pnl = (entry_price - exit_price) * size
+
+		trade_value = entry_price * size
+
+		# conservative: apply commission and slippage on entry and exit (both sides)
+		total_commission = 2.0 * self.params.commission * trade_value
+		total_slippage = 2.0 * self.params.slippage_perc * trade_value
+
+		net_pnl = gross_pnl - total_commission - total_slippage
+
+		holding_bars = len(self) - int(self._entry_bar) if self._entry_bar is not None else 0
+
+		self.trades.append(
+			{
+				"entry_bar": int(self._entry_bar) if self._entry_bar is not None else None,
+				"exit_bar": len(self),
+				"entry_price": float(entry_price),
+				"exit_price": float(exit_price),
+				"size": float(size),
+				"direction": direction,
+				"gross_pnl": float(gross_pnl),
+				"net_pnl": float(net_pnl),
+				"total_commission": float(total_commission),
+				"total_slippage": float(total_slippage),
+				"holding_bars": int(holding_bars),
+			}
+		)
+
+		# reset entry markers then issue a market close
+		self._entry_bar = None
+		self._entry_price = None
+		self._entry_size = 0
+		self.close()
 
 
 @dataclass(slots=True)
@@ -98,6 +157,7 @@ class BacktestRunResult:
 	equity_curve: pd.Series
 	trade_returns: pd.Series
 	metrics: BacktestMetrics
+	trade_ledger: pd.DataFrame
 
 
 def run_directional_backtest(
@@ -132,6 +192,8 @@ def run_directional_backtest(
 		confidence_threshold=config.confidence_threshold,
 		stop_loss_pct=config.stop_loss_pct,
 		max_holding_bars=config.max_holding_bars,
+		commission=config.commission,
+		slippage_perc=config.slippage_perc,
 	)
 
 	cerebro.broker.setcash(config.initial_cash)
@@ -147,10 +209,18 @@ def run_directional_backtest(
 	ret_series = pd.Series(time_return).sort_index()
 	equity_curve = (1.0 + ret_series.fillna(0.0)).cumprod() * config.initial_cash
 
-	trade_analyzer = result.analyzers.trade_analyzer.get_analysis()
-	won_total = float(getattr(getattr(trade_analyzer, "won", {}), "pnl", {}).get("total", 0.0) if isinstance(trade_analyzer, dict) else 0.0)
-	lost_total = float(getattr(getattr(trade_analyzer, "lost", {}), "pnl", {}).get("total", 0.0) if isinstance(trade_analyzer, dict) else 0.0)
-	trade_returns = pd.Series([won_total, lost_total], dtype=float)
+	# Prefer detailed ledger from strategy if available
+	if hasattr(result, "trades") and isinstance(result.trades, list):
+		ledgers = result.trades
+		trade_returns = pd.Series([float(t.get("net_pnl", 0.0)) for t in ledgers], dtype=float)
+		trade_ledger = pd.DataFrame(ledgers)
+	else:
+		# Fallback to TradeAnalyzer summary if ledger not present
+		trade_analyzer = result.analyzers.trade_analyzer.get_analysis()
+		won_total = float(getattr(getattr(trade_analyzer, "won", {}), "pnl", {}).get("total", 0.0) if isinstance(trade_analyzer, dict) else 0.0)
+		lost_total = float(getattr(getattr(trade_analyzer, "lost", {}), "pnl", {}).get("total", 0.0) if isinstance(trade_analyzer, dict) else 0.0)
+		trade_returns = pd.Series([won_total, lost_total], dtype=float)
+		trade_ledger = pd.DataFrame([])
 
 	metrics = compute_backtest_metrics(equity_curve=equity_curve, trade_returns=trade_returns)
-	return BacktestRunResult(equity_curve=equity_curve, trade_returns=trade_returns, metrics=metrics)
+	return BacktestRunResult(equity_curve=equity_curve, trade_returns=trade_returns, metrics=metrics, trade_ledger=trade_ledger)

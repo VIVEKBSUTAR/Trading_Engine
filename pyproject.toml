@@ -12,6 +12,7 @@ authors = [{ name = "Trading Engineering Team" }]
 dependencies = [
   "pandas>=2.2.0",
   "numpy>=1.26.0",
+  "requests>=2.32.0",
   "scikit-learn>=1.5.0",
   "vectorbt>=0.27.0",
   "backtrader>=1.9.78.123",
@@ -38,6 +39,8 @@ dev = [
 te-ingest = "trading_engine.cli.ingest:main"
 te-train = "trading_engine.cli.train:main"
 te-infer = "trading_engine.cli.infer:main"
+te-eval = "trading_engine.bench.eval_harness:main"
+te-nse-ingest = "main:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
