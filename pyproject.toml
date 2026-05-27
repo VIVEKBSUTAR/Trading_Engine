@@ -36,6 +36,8 @@ dev = [
 
 [project.scripts]
 te-ingest = "trading_engine.cli.ingest:main"
+te-train = "trading_engine.cli.train:main"
+te-infer = "trading_engine.cli.infer:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
