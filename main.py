@@ -1,22 +1,21 @@
-"""Entrypoint for production NSE option-chain ingestion pipeline."""
+"""Entrypoint for authenticated Kite Connect live connectivity."""
 
 from __future__ import annotations
 
+import signal
 import sys
+from threading import Event
 
 from loguru import logger
 
 from config.settings import AppSettings
-from ingestion.nse_fetcher import NSEOptionChainFetcher
-from ingestion.parser import OptionChainParser
-from ingestion.scheduler import IngestionScheduler
-from ingestion.validators import OptionChainValidator
-from storage.duckdb_manager import DuckDBManager
-from storage.parquet_writer import ParquetWriter
+from broker.kite_auth import KiteAuthError, KiteAuthManager
+from broker.kite_client import KiteMarketClient
+from broker.kite_stream import KiteStream
 
 
 def configure_logging(settings: AppSettings) -> None:
-    """Configure structured loguru sinks for console and file."""
+    """Configure structured loguru sinks for console and broker/runtime files."""
     logger.remove()
     logger.add(sys.stdout, level=settings.logging.level, enqueue=True, backtrace=False, diagnose=False)
     logger.add(
@@ -28,46 +27,93 @@ def configure_logging(settings: AppSettings) -> None:
         backtrace=False,
         diagnose=False,
     )
-
-
-def build_scheduler(settings: AppSettings) -> tuple[IngestionScheduler, DuckDBManager]:
-    """Build all pipeline components and return scheduler + DB manager."""
-    fetcher = NSEOptionChainFetcher(settings.api)
-    parser = OptionChainParser()
-    validator = OptionChainValidator()
-    parquet_writer = ParquetWriter(settings.storage)
-    duckdb_manager = DuckDBManager(settings.storage.duckdb_path)
-
-    scheduler = IngestionScheduler(
-        settings=settings,
-        fetcher=fetcher,
-        parser=parser,
-        validator=validator,
-        parquet_writer=parquet_writer,
-        duckdb_manager=duckdb_manager,
+    logger.add(
+        settings.logging.log_dir / settings.logging.broker_file_name,
+        level=settings.logging.level,
+        enqueue=True,
+        rotation=settings.logging.rotation,
+        retention=settings.logging.retention,
+        backtrace=False,
+        diagnose=False,
     )
-    return scheduler, duckdb_manager
 
 
 def main() -> int:
-    """Start the NSE option-chain scheduler until termination signal."""
+    """Start authenticated Kite connectivity and websocket streaming."""
     settings = AppSettings.from_env()
     configure_logging(settings)
-    logger.info("Initializing NSE ingestion pipeline", project_root=str(settings.storage.project_root))
-
-    scheduler, duckdb_manager = build_scheduler(settings)
-    scheduler.install_signal_handlers()
+    logger.info("Initializing Kite Connect runtime", project_root=str(settings.storage.project_root))
 
     try:
-        scheduler.run_forever()
+        auth = KiteAuthManager(settings.kite)
+    except KiteAuthError as exc:
+        logger.exception("Kite auth manager initialization failed", error=str(exc))
+        return 2
+
+    access_token = auth.resolve_access_token()
+    if not access_token and settings.kite.request_token:
+        try:
+            session = auth.exchange_request_token(settings.kite.request_token)
+            access_token = session.access_token
+        except KiteAuthError as exc:
+            logger.exception("Request-token exchange failed", error=str(exc))
+            return 2
+
+    if not access_token:
+        login_url = auth.login_url()
+        logger.warning("No Kite access token available. Complete the login flow first.", login_url=login_url)
+        print(login_url)
+        return 1
+
+    client = KiteMarketClient(settings.kite, auth_manager=auth)
+    try:
+        profile = client.validate_session()
+        snapshot = client.get_live_snapshot()
     except Exception as exc:  # noqa: BLE001
-        logger.exception("Fatal error in ingestion runtime", error=str(exc))
+        logger.exception("Unable to initialize live market client", error=str(exc))
+        return 2
+
+    logger.info(
+        "Live market snapshot acquired",
+        user_id=profile.get("user_id"),
+        nifty_last_price=snapshot.nifty_spot.last_price,
+        vix_last_price=snapshot.india_vix.last_price,
+        option_rows=len(snapshot.option_instruments),
+    )
+
+    stream = KiteStream(settings.kite, auth_manager=auth)
+    def _log_normalized_ticks(frame):
+        logger.info("Normalized live tick batch received", rows=len(frame))
+
+    stream.register_tick_handler(_log_normalized_ticks)
+
+    if settings.kite.stream_tokens:
+        stream.subscribe(list(settings.kite.stream_tokens))
+        logger.info("Pre-subscribed configured tokens", tokens=list(settings.kite.stream_tokens))
+    else:
+        logger.warning("No stream tokens configured. Websocket will connect without subscriptions.")
+
+    shutdown_event = Event()
+
+    def _handle_shutdown(_signum: int, _frame: object) -> None:
+        logger.warning("Shutdown signal received")
+        shutdown_event.set()
+        stream.stop()
+
+    signal.signal(signal.SIGINT, _handle_shutdown)
+    signal.signal(signal.SIGTERM, _handle_shutdown)
+
+    try:
+        stream.connect(threaded=True)
+        logger.info("Kite websocket started")
+        shutdown_event.wait()
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Fatal error in Kite runtime", error=str(exc))
         return 2
     finally:
-        duckdb_manager.close()
+        stream.stop()
 
     return 0
-
 
 if __name__ == "__main__":
     raise SystemExit(main())
