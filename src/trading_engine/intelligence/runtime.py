@@ -18,7 +18,7 @@ from ingestion.parser import OptionChainParser
 from ingestion.validators import OptionChainValidator
 from trading_engine.intelligence.engine import LiveIntelligenceEngine
 from trading_engine.intelligence.state import MarketStateAggregator
-from trading_engine.intelligence.models import IntelligenceReport
+from trading_engine.intelligence.models import IntelligenceReport, MarketState
 
 
 @dataclass(slots=True)
@@ -44,6 +44,7 @@ class LiveIntelligenceRuntime:
         self._aggregator = MarketStateAggregator()
         self._engine = LiveIntelligenceEngine(settings)
         self._latest_report: IntelligenceReport | None = None
+        self._latest_state: MarketState | None = None
 
         self._stream.register_tick_handler(self._on_tick_frame)
         self._stream.register_connect_handler(self._on_connect)
@@ -52,6 +53,11 @@ class LiveIntelligenceRuntime:
     def latest_report(self) -> IntelligenceReport | None:
         """Return the latest computed intelligence report."""
         return self._latest_report
+
+    @property
+    def latest_state(self) -> MarketState | None:
+        """Return the latest computed market state."""
+        return self._latest_state
 
     @property
     def stream(self) -> KiteStream:
@@ -73,7 +79,9 @@ class LiveIntelligenceRuntime:
             if self._callbacks.on_error:
                 self._callbacks.on_error(exc)
 
-        report = self._engine.process(self._aggregator.build_snapshot())
+        state = self._aggregator.build_market_state(snapshot)
+        self._latest_state = state
+        report = self._engine.process(snapshot, state=state)
         self._latest_report = report
         if self._callbacks.on_report:
             self._callbacks.on_report(report)
@@ -100,7 +108,9 @@ class LiveIntelligenceRuntime:
     def _on_tick_frame(self, frame: pd.DataFrame) -> None:
         self._aggregator.update_ticks(NormalizedTickBatch(frame=frame, row_count=len(frame), source="kite"))
         try:
-            self._latest_report = self._engine.process(self._aggregator.build_snapshot())
+            snapshot = self._aggregator.build_snapshot()
+            self._latest_state = self._aggregator.build_market_state(snapshot)
+            self._latest_report = self._engine.process(snapshot, state=self._latest_state)
             if self._callbacks.on_report:
                 self._callbacks.on_report(self._latest_report)
         except Exception as exc:  # noqa: BLE001

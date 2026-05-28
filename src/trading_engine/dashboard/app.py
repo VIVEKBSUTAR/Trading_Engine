@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pandas as pd
@@ -11,7 +12,7 @@ import streamlit as st
 from loguru import logger
 
 from config.settings import AppSettings
-from trading_engine.intelligence.models import IntelligenceReport, MarketRegime, SignalAction
+from trading_engine.intelligence.models import IntelligenceReport, MarketRegime, SessionPhase, TradeGrade
 from trading_engine.intelligence.runtime import LiveIntelligenceRuntime
 
 
@@ -46,6 +47,7 @@ def main() -> None:
     col1, col2 = st.columns([3.2, 1.25], gap="large")
 
     with col1:
+        _render_state_panel(report)
         _render_price_chart(report)
         _render_probability_panel(report)
         _render_option_chain_panel(report)
@@ -72,9 +74,24 @@ def _render_header(report: IntelligenceReport) -> None:
     vix = report.snapshot.vix_value or 0.0
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Spot", f"{spot:,.2f}", delta=f"{report.probabilities.bullish_probability - report.probabilities.bearish_probability:+.1%}")
-    c2.metric("VIX", f"{vix:,.2f}", delta=f"{report.regime.regime.value}")
-    c3.metric("Regime", report.regime.regime.value.replace("_", " ").title(), delta=f"{report.regime.confidence:.0%}")
-    c4.metric("Signal", report.signal.action.value.replace("_", " ").title(), delta=f"{report.signal.confidence:.0%}")
+    c2.metric("VIX", f"{vix:,.2f}", delta=f"{report.state.volatility_state.value}")
+    c3.metric("Regime", report.state.regime.value.replace("_", " ").title(), delta=f"{report.state.regime_confidence:.0%}")
+    c4.metric("Signal", report.signal.action.value.replace("_", " ").title(), delta=f"Grade {report.signal.trade_grade.value}")
+
+
+def _render_state_panel(report: IntelligenceReport) -> None:
+    st.subheader("Market State")
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Trend", report.state.trend_state.value.replace("_", " ").title(), delta=f"{report.state.trend_strength:+.3f}")
+    c2.metric("Volatility", report.state.volatility_state.value.replace("_", " ").title(), delta=f"{report.state.session_quality:.0%}")
+    c3.metric("Session", report.state.session_state.value.replace("_", " ").title())
+    c4.metric("Trade Grade", report.state.trade_grade.value)
+    c5.metric("Quality", f"{report.state.quality_score:.0%}", delta=report.state.transition.stage.value.replace("_", " ").title())
+    st.write(
+        f"Transition: **{report.transition.stage.value.replace('_', ' ').title()}** | "
+        f"Directional bias: **{report.state.directional_bias.value.replace('_', ' ').title()}** | "
+        f"Trap probability: **{report.state.trap_probability:.0%}**"
+    )
 
 
 def _render_price_chart(report: IntelligenceReport) -> None:
@@ -125,11 +142,15 @@ def _render_signal_ticket(report: IntelligenceReport) -> None:
     st.subheader("Signal Ticket")
     st.write(f"Action: **{report.signal.action.value.upper()}**")
     st.write(f"Confidence: **{report.signal.confidence:.1%}**")
+    st.write(f"Trade Grade: **{report.signal.trade_grade.value}**")
     st.write(f"Strike: **{report.strike.strike if report.strike else 'N/A'}**")
+    st.write(f"Expiry: **{report.strike.expiry or 'N/A'}**")
     st.write(f"Reasoning: {', '.join(report.signal.reasoning) if report.signal.reasoning else 'No trade filter'}")
     st.write(f"Entry: {report.signal.entry_reference if report.signal.entry_reference is not None else 'N/A'}")
     st.write(f"Stop Loss: {report.signal.stop_loss if report.signal.stop_loss is not None else 'N/A'}")
     st.write(f"Target: {report.signal.target if report.signal.target is not None else 'N/A'}")
+    st.write(f"Trap Probability: **{report.trap.trap_score:.1%}**")
+    st.write(f"Signal Expires: **{_expiry_text(report.signal.expires_at)}**")
 
 
 def _render_trade_monitor(report: IntelligenceReport) -> None:
@@ -142,6 +163,8 @@ def _render_trade_monitor(report: IntelligenceReport) -> None:
     trade_frame = pd.DataFrame([asdict(trade) for trade in open_trades])
     st.dataframe(trade_frame, use_container_width=True, height=260)
     st.caption(f"Total closed PnL: {report.trade_update.total_pnl:,.2f}")
+    if report.trade_update.expired_trades:
+        st.caption(f"Expired trades: {len(report.trade_update.expired_trades)}")
 
 
 def _render_alerts(report: IntelligenceReport) -> None:
@@ -151,6 +174,14 @@ def _render_alerts(report: IntelligenceReport) -> None:
         return
     for item in report.trade_update.alert_messages[-10:]:
         st.warning(item)
+
+
+def _expiry_text(expiry: datetime | None) -> str:
+    if expiry is None:
+        return "N/A"
+    remaining = expiry - datetime.now(UTC)
+    minutes = max(int(remaining.total_seconds() // 60), 0)
+    return f"{expiry.isoformat()} ({minutes}m left)"
 
 
 if __name__ == "__main__":
