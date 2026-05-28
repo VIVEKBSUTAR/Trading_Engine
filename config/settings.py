@@ -90,6 +90,33 @@ class KiteSettings:
 
 
 @dataclass(slots=True)
+class IntelligenceSettings:
+    """Thresholds and runtime controls for the live market intelligence engine."""
+
+    bullish_probability_threshold: float = 0.65
+    bearish_probability_threshold: float = 0.65
+    trap_probability_threshold: float = 0.60
+    confidence_floor: float = 0.60
+    breakout_lookback_bars: int = 20
+    structure_lookback_bars: int = 50
+    max_trades_per_day: int = 3
+    max_daily_loss_pct: float = 0.02
+    dashboard_refresh_seconds: int = 5
+    default_expiry_days: int = 7
+
+
+@dataclass(slots=True)
+class RiskSettings:
+    """Capital and exposure controls for signal sizing."""
+
+    capital: float = 10_000_000.0
+    risk_per_trade: float = 0.005
+    max_capital_exposure: float = 0.10
+    contract_multiplier: float = 1.0
+    min_units: int = 1
+
+
+@dataclass(slots=True)
 class AppSettings:
     """Aggregate runtime settings used by pipeline components."""
 
@@ -98,6 +125,8 @@ class AppSettings:
     scheduler: SchedulerSettings
     logging: LoggingSettings
     kite: KiteSettings
+    intelligence: IntelligenceSettings
+    risk: RiskSettings
 
     @classmethod
     def from_env(cls, project_root: Path | None = None) -> AppSettings:
@@ -156,6 +185,25 @@ class AppSettings:
                 connect_timeout=int(os.getenv("KITE_CONNECT_TIMEOUT", "30")),
                 stream_tokens=stream_tokens,
                 stream_mode=os.getenv("KITE_STREAM_MODE", "full").lower(),
+            ),
+            intelligence=IntelligenceSettings(
+                bullish_probability_threshold=float(os.getenv("TE_BULLISH_PROB_THRESHOLD", "0.65")),
+                bearish_probability_threshold=float(os.getenv("TE_BEARISH_PROB_THRESHOLD", "0.65")),
+                trap_probability_threshold=float(os.getenv("TE_TRAP_PROB_THRESHOLD", "0.60")),
+                confidence_floor=float(os.getenv("TE_CONFIDENCE_FLOOR", "0.60")),
+                breakout_lookback_bars=int(os.getenv("TE_BREAKOUT_LOOKBACK_BARS", "20")),
+                structure_lookback_bars=int(os.getenv("TE_STRUCTURE_LOOKBACK_BARS", "50")),
+                max_trades_per_day=int(os.getenv("TE_MAX_TRADES_PER_DAY", "3")),
+                max_daily_loss_pct=float(os.getenv("TE_MAX_DAILY_LOSS_PCT", "0.02")),
+                dashboard_refresh_seconds=int(os.getenv("TE_DASHBOARD_REFRESH_SECONDS", "5")),
+                default_expiry_days=int(os.getenv("TE_DEFAULT_EXPIRY_DAYS", "7")),
+            ),
+            risk=RiskSettings(
+                capital=float(os.getenv("TE_CAPITAL", "10000000")),
+                risk_per_trade=float(os.getenv("TE_RISK_PER_TRADE", "0.005")),
+                max_capital_exposure=float(os.getenv("TE_MAX_CAPITAL_EXPOSURE", "0.10")),
+                contract_multiplier=float(os.getenv("TE_CONTRACT_MULTIPLIER", "1.0")),
+                min_units=int(os.getenv("TE_MIN_UNITS", "1")),
             ),
         )
 

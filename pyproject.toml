@@ -23,6 +23,8 @@ dependencies = [
   "sqlalchemy>=2.0.0",
   "fastapi>=0.111.0",
   "loguru>=0.7.2",
+  "streamlit>=1.37.0",
+  "plotly>=5.22.0",
   "pydantic>=2.8.0",
   "pydantic-settings>=2.3.0",
   "PyYAML>=6.0.1"
@@ -44,6 +46,8 @@ te-infer = "trading_engine.cli.infer:main"
 te-eval = "trading_engine.bench.eval_harness:main"
 te-nse-ingest = "main:main"
 te-kite-live = "main:main"
+te-dashboard = "trading_engine.cli.dashboard:main"
+te-intelligence = "trading_engine.cli.intelligence:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
