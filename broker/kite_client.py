@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any
 
 import pandas as pd
 from loguru import logger
 
+from broker.api_security import APISecurityError, APISecurityGuard
 from broker.kite_auth import KiteAuthError, KiteAuthManager
 from config.settings import KiteSettings
 
@@ -24,6 +26,9 @@ class MarketQuote:
     last_price: float | None
     change: float | None
     ohlc: dict[str, float | None]
+    received_at: datetime
+    exchange_timestamp: datetime | None
+    last_trade_time: datetime | None
     raw: dict[str, Any]
 
 
@@ -39,9 +44,10 @@ class LiveMarketSnapshot:
 class KiteMarketClient:
     """Wraps KiteConnect REST calls needed for live market intelligence."""
 
-    def __init__(self, settings: KiteSettings, auth_manager: KiteAuthManager | None = None) -> None:
+    def __init__(self, settings: KiteSettings, auth_manager: KiteAuthManager | None = None, security_guard: APISecurityGuard | None = None) -> None:
         self._settings = settings
-        self._auth_manager = auth_manager or KiteAuthManager(settings)
+        self._security_guard = security_guard
+        self._auth_manager = auth_manager or KiteAuthManager(settings, security_guard=security_guard)
         self._kite = self._auth_manager.kite
 
     @property
@@ -56,15 +62,21 @@ class KiteMarketClient:
     def get_quote(self, instrument: str) -> MarketQuote:
         """Fetch a structured quote for an instrument string like NSE:INFY."""
         try:
+            self._validate_instrument_identifier(instrument)
+            self._record_request("quote", instrument)
             response = self._kite.quote(instrument)
         except Exception as exc:  # noqa: BLE001
+            self._record_failure(f"quote_failed:{instrument}:{exc}")
             raise KiteClientError(f"Quote fetch failed for {instrument}: {exc}") from exc
 
         payload = response.get(instrument)
         if not isinstance(payload, dict):
+            self._record_failure(f"quote_missing_payload:{instrument}")
             raise KiteClientError(f"Quote response missing payload for {instrument}")
 
         ohlc = payload.get("ohlc") if isinstance(payload.get("ohlc"), dict) else {}
+        exchange_timestamp = _safe_datetime(payload.get("exchange_timestamp"))
+        last_trade_time = _safe_datetime(payload.get("last_trade_time"))
         structured = MarketQuote(
             instrument=instrument,
             last_price=_safe_float(payload.get("last_price")),
@@ -75,8 +87,23 @@ class KiteMarketClient:
                 "low": _safe_float(ohlc.get("low")),
                 "close": _safe_float(ohlc.get("close")),
             },
+            received_at=datetime.now(UTC),
+            exchange_timestamp=exchange_timestamp,
+            last_trade_time=last_trade_time,
             raw=payload,
         )
+        if self._security_guard is not None:
+            try:
+                self._security_guard.validate_quote_payload(payload, instrument=instrument)
+                self._security_guard.validate_fresh_timestamp(
+                    exchange_timestamp or last_trade_time or structured.received_at,
+                    max_age_seconds=self._security_guard.settings.stale_snapshot_seconds,
+                    label=f"quote:{instrument}",
+                )
+                self._security_guard.register_rest_success()
+            except APISecurityError as exc:
+                self._record_failure(str(exc))
+                raise KiteClientError(f"Quote validation failed for {instrument}: {exc}") from exc
         logger.info("Fetched quote", instrument=instrument, last_price=structured.last_price)
         return structured
 
@@ -97,8 +124,10 @@ class KiteMarketClient:
     ) -> pd.DataFrame:
         """Fetch and filter live option instruments for the requested underlying."""
         try:
+            self._record_request("instruments", exchange)
             records = self._kite.instruments(exchange)
         except Exception as exc:  # noqa: BLE001
+            self._record_failure(f"instruments_failed:{exchange}:{exc}")
             raise KiteClientError(f"Instrument fetch failed for exchange={exchange}: {exc}") from exc
 
         frame = pd.DataFrame.from_records(records)
@@ -124,6 +153,7 @@ class KiteMarketClient:
             underlying=underlying,
             rows=len(filtered),
         )
+        self._record_success()
         return filtered.reset_index(drop=True)
 
     def get_live_snapshot(self) -> LiveMarketSnapshot:
@@ -137,6 +167,32 @@ class KiteMarketClient:
             option_instruments=option_instruments,
         )
 
+    def validate_session(self) -> dict[str, Any]:
+        """Validate the current session and record the result with the security guard."""
+        profile = self._auth_manager.validate_session()
+        self._record_success()
+        return profile
+
+    def _validate_instrument_identifier(self, instrument: str) -> None:
+        if self._security_guard is None:
+            return
+        self._security_guard.validate_instrument_identifier(instrument)
+
+    def _record_request(self, api_name: str, endpoint: str) -> None:
+        if self._security_guard is None:
+            return
+        self._security_guard.register_rest_request(api_name, endpoint)
+
+    def _record_success(self) -> None:
+        if self._security_guard is None:
+            return
+        self._security_guard.register_rest_success()
+
+    def _record_failure(self, reason: str) -> None:
+        if self._security_guard is None:
+            return
+        self._security_guard.register_rest_failure(reason)
+
 
 def _safe_float(value: Any) -> float | None:
     """Best-effort float coercion without raising on missing values."""
@@ -145,4 +201,16 @@ def _safe_float(value: Any) -> float | None:
             return None
         return float(value)
     except (TypeError, ValueError):
+        return None
+
+
+def _safe_datetime(value: Any) -> datetime | None:
+    try:
+        if value is None:
+            return None
+        parsed = pd.to_datetime(value, utc=True, errors="coerce")
+        if pd.isna(parsed):
+            return None
+        return parsed.to_pydatetime()
+    except Exception:  # noqa: BLE001
         return None

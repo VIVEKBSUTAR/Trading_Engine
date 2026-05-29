@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Callable
 
 import pandas as pd
 from loguru import logger
 
+from broker.api_security import APISecurityError, APISecurityGuard
 from broker.kite_auth import KiteAuthManager
 from broker.kite_client import KiteMarketClient
 from broker.kite_stream import KiteStream
@@ -35,9 +37,10 @@ class LiveIntelligenceRuntime:
     def __init__(self, settings: AppSettings, callbacks: RuntimeCallbacks | None = None) -> None:
         self._settings = settings
         self._callbacks = callbacks or RuntimeCallbacks()
-        self._auth = KiteAuthManager(settings.kite)
-        self._client = KiteMarketClient(settings.kite, auth_manager=self._auth)
-        self._stream = KiteStream(settings.kite, auth_manager=self._auth)
+        self._security = APISecurityGuard(settings.security)
+        self._auth = KiteAuthManager(settings.kite, security_guard=self._security)
+        self._client = KiteMarketClient(settings.kite, auth_manager=self._auth, security_guard=self._security)
+        self._stream = KiteStream(settings.kite, auth_manager=self._auth, security_guard=self._security)
         self._fetcher = NSEOptionChainFetcher(settings.api)
         self._parser = OptionChainParser()
         self._validator = OptionChainValidator()
@@ -64,17 +67,30 @@ class LiveIntelligenceRuntime:
         """Expose the underlying websocket stream wrapper."""
         return self._stream
 
+    @property
+    def api_health(self):
+        """Expose API health for UI and supervisory consumers."""
+        return self._security.health_snapshot()
+
     def refresh_once(self) -> IntelligenceReport:
         """Poll REST sources once and compute a fresh intelligence report."""
+        self._security.validate_environment()
         snapshot = self._client.get_live_snapshot()
         self._aggregator.update_from_snapshot(snapshot)
 
         try:
             chain_result = self._fetcher.fetch_option_chain()
+            self._security.validate_fresh_timestamp(
+                chain_result.fetched_at_utc,
+                max_age_seconds=self._settings.security.stale_option_chain_seconds,
+                label="option_chain",
+            )
             chain_frame = self._parser.parse(chain_result.payload, chain_result.fetched_at_utc)
             validated = self._validator.validate(chain_frame)
             self._aggregator.update_option_chain(validated.frame)
+            self._security.register_rest_success()
         except Exception as exc:  # noqa: BLE001
+            self._security.register_rest_failure(f"option_chain_refresh_failed:{exc}")
             logger.warning("Option-chain refresh failed; continuing with cached state", error=str(exc))
             if self._callbacks.on_error:
                 self._callbacks.on_error(exc)
@@ -89,6 +105,8 @@ class LiveIntelligenceRuntime:
 
     def start_streaming(self) -> None:
         """Start websocket streaming when tokens are configured."""
+        if self._security.safe_mode:
+            raise APISecurityError("Safe mode is active; streaming is blocked")
         if self._settings.kite.stream_tokens:
             self._stream.subscribe(list(self._settings.kite.stream_tokens))
         self._stream.connect(threaded=True)

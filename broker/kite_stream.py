@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from threading import Event
 from typing import Any, Callable
 
@@ -10,6 +11,7 @@ import pandas as pd
 from kiteconnect import KiteTicker
 from loguru import logger
 
+from broker.api_security import APISecurityError, APISecurityGuard
 from broker.kite_auth import KiteAuthError, KiteAuthManager
 from broker.normalizer import KiteTickNormalizer
 from config.settings import KiteSettings
@@ -26,14 +28,20 @@ class StreamState:
     connected: bool = False
     subscribed_tokens: set[int] = field(default_factory=set)
     reconnect_attempts: int = 0
+    last_tick_at: datetime | None = None
+    last_heartbeat_at: datetime | None = None
+    duplicate_ticks: int = 0
+    out_of_order_ticks: int = 0
+    safe_mode: bool = False
 
 
 class KiteStream:
     """Wrap KiteTicker with structured callbacks and subscription management."""
 
-    def __init__(self, settings: KiteSettings, auth_manager: KiteAuthManager | None = None) -> None:
+    def __init__(self, settings: KiteSettings, auth_manager: KiteAuthManager | None = None, security_guard: APISecurityGuard | None = None) -> None:
         self._settings = settings
-        self._auth_manager = auth_manager or KiteAuthManager(settings)
+        self._security_guard = security_guard
+        self._auth_manager = auth_manager or KiteAuthManager(settings, security_guard=security_guard)
         access_token = self._auth_manager.ensure_access_token()
 
         if not settings.api_key:
@@ -123,6 +131,8 @@ class KiteStream:
 
     def connect(self, *, threaded: bool = True) -> None:
         """Open websocket connection using the official KiteTicker client."""
+        if self._security_guard is not None and self._security_guard.safe_mode:
+            raise KiteAuthError("Safe mode is active; websocket connection is blocked")
         logger.info(
             "Connecting KiteTicker",
             reconnect=self._settings.reconnect,
@@ -158,6 +168,7 @@ class KiteStream:
 
     def _on_connect(self, ws: KiteTicker, _response: Any) -> None:
         self._state.connected = True
+        self._state.safe_mode = bool(self._security_guard.safe_mode) if self._security_guard is not None else False
         self._connected_event.set()
         logger.info("KiteTicker connected")
 
@@ -175,6 +186,8 @@ class KiteStream:
 
     def _on_ticks(self, _ws: KiteTicker, ticks: list[dict[str, Any]]) -> None:
         logger.debug("Received tick batch", rows=len(ticks))
+        if self._security_guard is not None:
+            self._security_guard.register_heartbeat()
 
         for handler in self._raw_tick_handlers:
             try:
@@ -186,6 +199,21 @@ class KiteStream:
         if normalized.row_count == 0:
             return
 
+        self._state.last_tick_at = datetime.now(UTC)
+
+        if self._security_guard is not None:
+            try:
+                notes = self._security_guard.validate_stream_frame(normalized.frame)
+                self._state.duplicate_ticks = self._security_guard.health_snapshot().duplicate_ticks
+                self._state.out_of_order_ticks = self._security_guard.health_snapshot().out_of_order_ticks
+                self._state.safe_mode = self._security_guard.safe_mode
+                logger.debug("Stream integrity notes", notes=notes)
+            except APISecurityError as exc:
+                self._state.safe_mode = True
+                logger.error("Stream integrity validation failed", error=str(exc))
+                self.stop()
+                return
+
         for handler in self._tick_handlers:
             try:
                 handler(normalized.frame)
@@ -194,6 +222,7 @@ class KiteStream:
 
     def _on_close(self, _ws: KiteTicker, code: int | None, reason: str | None) -> None:
         self._state.connected = False
+        self._state.safe_mode = bool(self._security_guard.safe_mode) if self._security_guard is not None else self._state.safe_mode
         logger.warning("KiteTicker closed", code=code, reason=reason)
         for handler in self._close_handlers:
             try:
@@ -202,16 +231,26 @@ class KiteStream:
                 logger.exception("Close handler failed", error=str(exc))
 
     def _on_error(self, _ws: KiteTicker, code: int | None, reason: str | None) -> None:
+        if self._security_guard is not None:
+            self._security_guard.register_reconnect()
         logger.error("KiteTicker error", code=code, reason=reason)
 
     def _on_reconnect(self, _ws: KiteTicker, attempts_count: int) -> None:
         self._state.reconnect_attempts = attempts_count
+        if self._security_guard is not None:
+            self._security_guard.register_reconnect()
         logger.warning("KiteTicker reconnect attempt", attempts=attempts_count)
 
     def _on_noreconnect(self, _ws: KiteTicker) -> None:
+        if self._security_guard is not None:
+            self._security_guard.mark_safe_mode("Websocket exhausted reconnect attempts")
+            self._state.safe_mode = True
         logger.error("KiteTicker exhausted reconnect attempts")
 
     def _on_message(self, _ws: KiteTicker, _payload: Any, is_binary: bool) -> None:
+        if self._security_guard is not None:
+            self._security_guard.register_heartbeat()
+            self._state.last_heartbeat_at = datetime.now(UTC)
         logger.debug("KiteTicker message received", is_binary=is_binary)
 
     def _on_order_update(self, _ws: KiteTicker, data: dict[str, Any]) -> None:

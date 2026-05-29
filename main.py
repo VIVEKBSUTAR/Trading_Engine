@@ -8,10 +8,11 @@ from threading import Event
 
 from loguru import logger
 
-from config.settings import AppSettings
+from broker.api_security import APISecurityError, APISecurityGuard
 from broker.kite_auth import KiteAuthError, KiteAuthManager
 from broker.kite_client import KiteMarketClient
 from broker.kite_stream import KiteStream
+from config.settings import AppSettings
 
 
 def configure_logging(settings: AppSettings) -> None:
@@ -44,8 +45,24 @@ def main() -> int:
     configure_logging(settings)
     logger.info("Initializing Kite Connect runtime", project_root=str(settings.storage.project_root))
 
+    security = APISecurityGuard(settings.security)
     try:
-        auth = KiteAuthManager(settings.kite)
+        security.validate_environment()
+    except APISecurityError as exc:
+        logger.exception("Invalid API execution environment", error=str(exc))
+        return 2
+
+    if not security.should_allow_execution():
+        logger.error(
+            "Live execution is blocked by security policy",
+            environment=settings.security.environment,
+            allow_live_execution=settings.security.allow_live_execution,
+            manual_approval_required=settings.security.require_manual_execution_approval,
+        )
+        return 1
+
+    try:
+        auth = KiteAuthManager(settings.kite, security_guard=security)
     except KiteAuthError as exc:
         logger.exception("Kite auth manager initialization failed", error=str(exc))
         return 2
@@ -65,7 +82,7 @@ def main() -> int:
         print(login_url)
         return 1
 
-    client = KiteMarketClient(settings.kite, auth_manager=auth)
+    client = KiteMarketClient(settings.kite, auth_manager=auth, security_guard=security)
     try:
         profile = client.validate_session()
         snapshot = client.get_live_snapshot()
@@ -81,7 +98,7 @@ def main() -> int:
         option_rows=len(snapshot.option_instruments),
     )
 
-    stream = KiteStream(settings.kite, auth_manager=auth)
+    stream = KiteStream(settings.kite, auth_manager=auth, security_guard=security)
     def _log_normalized_ticks(frame):
         logger.info("Normalized live tick batch received", rows=len(frame))
 
@@ -104,6 +121,8 @@ def main() -> int:
     signal.signal(signal.SIGTERM, _handle_shutdown)
 
     try:
+        if security.safe_mode:
+            raise APISecurityError("Safe mode is active; refusing to start websocket execution")
         stream.connect(threaded=True)
         logger.info("Kite websocket started")
         shutdown_event.wait()

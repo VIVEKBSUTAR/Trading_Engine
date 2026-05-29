@@ -11,6 +11,7 @@ from kiteconnect import KiteConnect
 from kiteconnect.exceptions import TokenException
 from loguru import logger
 
+from broker.api_security import APISecurityError, APISecurityGuard
 from config.settings import KiteSettings
 
 
@@ -29,11 +30,12 @@ class KiteSessionResult:
 class KiteAuthManager:
     """Owns KiteConnect auth lifecycle and access-token persistence."""
 
-    def __init__(self, settings: KiteSettings) -> None:
+    def __init__(self, settings: KiteSettings, security_guard: APISecurityGuard | None = None) -> None:
         if not settings.api_key:
             raise KiteAuthError("KITE_API_KEY is required")
 
         self._settings = settings
+        self._security_guard = security_guard
         self._kite = KiteConnect(api_key=settings.api_key)
         self._kite.set_session_expiry_hook(self._on_session_expired)
 
@@ -102,8 +104,14 @@ class KiteAuthManager:
             raise KiteAuthError("KITE_API_SECRET is required for request-token exchange")
 
         try:
+            if self._security_guard is not None:
+                self._security_guard.register_rest_request("kite", "generate_session")
             session = self._kite.generate_session(token, self._settings.api_secret)
+            if self._security_guard is not None:
+                self._security_guard.register_rest_success()
         except Exception as exc:  # noqa: BLE001 - official client raises its own exceptions
+            if self._security_guard is not None:
+                self._security_guard.register_rest_failure(f"session_exchange_failed:{exc}")
             raise KiteAuthError(f"Kite session exchange failed: {exc}") from exc
 
         access_token = session.get("access_token")
@@ -133,10 +141,18 @@ class KiteAuthManager:
     def validate_session(self) -> dict[str, Any]:
         """Validate the currently authenticated session using the official profile API."""
         try:
+            if self._security_guard is not None:
+                self._security_guard.register_rest_request("kite", "profile")
             profile = self._kite.profile()
+            if self._security_guard is not None:
+                self._security_guard.register_rest_success()
         except TokenException as exc:
+            if self._security_guard is not None:
+                self._security_guard.register_rest_failure(f"token_validation_failed:{exc}")
             raise KiteAuthError(f"Kite session validation failed: {exc}") from exc
         except Exception as exc:  # noqa: BLE001
+            if self._security_guard is not None:
+                self._security_guard.register_rest_failure(f"profile_request_failed:{exc}")
             raise KiteAuthError(f"Kite profile request failed: {exc}") from exc
 
         if not isinstance(profile, dict):

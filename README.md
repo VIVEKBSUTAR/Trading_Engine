@@ -220,8 +220,9 @@ There are two configuration surfaces in the repo:
 3. `SchedulerSettings` for refresh cadence and symbol selection.
 4. `LoggingSettings` for log sinks and retention.
 5. `KiteSettings` for auth, reconnect behavior, and streaming tokens.
-6. `IntelligenceSettings` for live signal and state thresholds.
-7. `RiskSettings` for capital and exposure controls.
+6. `SecuritySettings` for environment separation, freshness, rate limits, and safe mode.
+7. `IntelligenceSettings` for live signal and state thresholds.
+8. `RiskSettings` for capital and exposure controls.
 
 Key intelligence environment variables currently supported include:
 
@@ -258,6 +259,20 @@ Broker/runtime variables include:
 9. `KITE_CONNECT_TIMEOUT`
 10. `KITE_STREAM_TOKENS`
 11. `KITE_STREAM_MODE`
+12. `TE_ENVIRONMENT`
+13. `TE_ALLOW_LIVE_EXECUTION`
+14. `TE_REQUIRE_MANUAL_EXECUTION_APPROVAL`
+15. `TE_API_REQUESTS_PER_MINUTE`
+16. `TE_SECURITY_REQUEST_TIMEOUT_SECONDS`
+17. `TE_STALE_SNAPSHOT_SECONDS`
+18. `TE_STALE_OPTION_CHAIN_SECONDS`
+19. `TE_STALE_STREAM_SECONDS`
+20. `TE_STREAM_HEARTBEAT_TIMEOUT_SECONDS`
+21. `TE_RECONNECT_COOLDOWN_SECONDS`
+22. `TE_MAX_RECONNECT_ATTEMPTS`
+23. `TE_MAX_DUPLICATE_TICKS`
+24. `TE_MAX_OUT_OF_ORDER_TICKS`
+25. `TE_MAX_PAYLOAD_AGE_SECONDS`
 
 ### YAML research configuration
 
@@ -288,6 +303,10 @@ source .venv/bin/activate
 te-dashboard
 ```
 
+If `te-dashboard` is not on your PATH yet, install the package in editable mode first with `pip install -e ".[dev]"`.
+
+If you prefer a direct Streamlit launch, the dashboard entrypoint is `src/trading_engine/dashboard/app.py`.
+
 3. Start the live intelligence runtime:
 
 ```bash
@@ -307,6 +326,14 @@ PYTHONPATH=src:. .venv/bin/python -m compileall -q src broker config main.py
 ```
 
 The dashboard is the best place to monitor the terminal-style market state view, signal ticket, alerts, open trade monitor, and option-chain intelligence. The live runtime is what refreshes the engine continuously.
+
+## API Security
+
+The live stack now prefers safe failure over execution. If the environment is not `live` or `paper`, if manual approval is required, if REST requests exceed the configured limit, or if websocket / snapshot data becomes stale, the runtime drops into safe mode and suppresses execution.
+
+The most important live-control variables are `TE_ENVIRONMENT`, `TE_ALLOW_LIVE_EXECUTION`, `TE_REQUIRE_MANUAL_EXECUTION_APPROVAL`, `TE_API_REQUESTS_PER_MINUTE`, `TE_STALE_SNAPSHOT_SECONDS`, `TE_STALE_OPTION_CHAIN_SECONDS`, and `TE_STALE_STREAM_SECONDS`.
+
+The dashboard exposes live API health so you can see when execution is blocked, when reconnects spike, and when ticks or snapshots are stale.
 
 ## Commands
 

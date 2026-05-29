@@ -55,6 +55,7 @@ def main() -> None:
         _render_structure_panel(report)
 
     with right:
+        _render_api_health_panel(runtime)
         _render_trade_monitor(report)
         _render_alerts(report)
         _render_analytics_panel(report)
@@ -259,6 +260,30 @@ def _render_trade_monitor(report: IntelligenceReport) -> None:
     st.caption(f"Total closed P&L: {report.trade_update.total_pnl:,.2f}")
     if report.trade_update.alert_messages:
         st.caption(f"Lifecycle notes: {report.trade_update.alert_messages[-1]}")
+
+
+def _render_api_health_panel(runtime: LiveIntelligenceRuntime) -> None:
+    st.subheader("API Health")
+    health = runtime.api_health
+    columns = st.columns(2)
+    columns[0].metric("Environment", health.environment.title(), delta="Safe Mode" if health.safe_mode else "Active")
+    columns[1].metric("Execution", "Allowed" if health.execution_allowed else "Blocked")
+
+    metrics = st.columns(3)
+    metrics[0].metric("REST Requests", health.rest_requests)
+    metrics[1].metric("REST Failures", health.rest_failures)
+    metrics[2].metric("Rate Limit Hits", health.rate_limit_hits)
+
+    stream_metrics = st.columns(3)
+    stream_metrics[0].metric("Reconnects", health.reconnect_attempts)
+    stream_metrics[1].metric("Duplicate Ticks", health.duplicate_ticks)
+    stream_metrics[2].metric("Out of Order", health.out_of_order_ticks)
+
+    if health.last_heartbeat_at is not None:
+        st.caption(f"Last heartbeat: {health.last_heartbeat_at.isoformat()}")
+    if health.notes:
+        for note in health.notes[-3:]:
+            st.warning(note)
 
 
 def _render_alerts(report: IntelligenceReport) -> None:

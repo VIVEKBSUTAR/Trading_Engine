@@ -90,6 +90,26 @@ class KiteSettings:
 
 
 @dataclass(slots=True)
+class SecuritySettings:
+    """API integrity, rate-limit, and environment-separation controls."""
+
+    environment: str = "development"
+    allow_live_execution: bool = False
+    require_manual_execution_approval: bool = True
+    api_requests_per_minute: int = 120
+    request_timeout_seconds: int = 15
+    stale_snapshot_seconds: int = 20
+    stale_option_chain_seconds: int = 120
+    stale_stream_seconds: int = 20
+    stream_heartbeat_timeout_seconds: int = 15
+    reconnect_cooldown_seconds: int = 10
+    max_reconnect_attempts: int = 5
+    max_duplicate_ticks: int = 3
+    max_out_of_order_ticks: int = 3
+    max_payload_age_seconds: int = 30
+
+
+@dataclass(slots=True)
 class IntelligenceSettings:
     """Thresholds and runtime controls for the live market intelligence engine."""
 
@@ -134,6 +154,7 @@ class AppSettings:
     scheduler: SchedulerSettings
     logging: LoggingSettings
     kite: KiteSettings
+    security: SecuritySettings
     intelligence: IntelligenceSettings
     risk: RiskSettings
 
@@ -163,6 +184,10 @@ class AppSettings:
             for token in stream_tokens_raw.split(",")
             if token.strip()
         )
+
+        environment = os.getenv("TE_ENVIRONMENT", "development").strip().lower()
+        allow_live_execution = os.getenv("TE_ALLOW_LIVE_EXECUTION", "false").lower() in {"1", "true", "yes"}
+        require_manual_execution_approval = os.getenv("TE_REQUIRE_MANUAL_EXECUTION_APPROVAL", "true").lower() in {"1", "true", "yes"}
 
         settings = cls(
             api=APISettings(timeout_seconds=timeout_seconds, max_retries=max_retries),
@@ -194,6 +219,22 @@ class AppSettings:
                 connect_timeout=int(os.getenv("KITE_CONNECT_TIMEOUT", "30")),
                 stream_tokens=stream_tokens,
                 stream_mode=os.getenv("KITE_STREAM_MODE", "full").lower(),
+            ),
+            security=SecuritySettings(
+                environment=environment,
+                allow_live_execution=allow_live_execution,
+                require_manual_execution_approval=require_manual_execution_approval,
+                api_requests_per_minute=int(os.getenv("TE_API_REQUESTS_PER_MINUTE", "120")),
+                request_timeout_seconds=int(os.getenv("TE_SECURITY_REQUEST_TIMEOUT_SECONDS", str(timeout_seconds))),
+                stale_snapshot_seconds=int(os.getenv("TE_STALE_SNAPSHOT_SECONDS", "20")),
+                stale_option_chain_seconds=int(os.getenv("TE_STALE_OPTION_CHAIN_SECONDS", "120")),
+                stale_stream_seconds=int(os.getenv("TE_STALE_STREAM_SECONDS", "20")),
+                stream_heartbeat_timeout_seconds=int(os.getenv("TE_STREAM_HEARTBEAT_TIMEOUT_SECONDS", "15")),
+                reconnect_cooldown_seconds=int(os.getenv("TE_RECONNECT_COOLDOWN_SECONDS", "10")),
+                max_reconnect_attempts=int(os.getenv("TE_MAX_RECONNECT_ATTEMPTS", "5")),
+                max_duplicate_ticks=int(os.getenv("TE_MAX_DUPLICATE_TICKS", "3")),
+                max_out_of_order_ticks=int(os.getenv("TE_MAX_OUT_OF_ORDER_TICKS", "3")),
+                max_payload_age_seconds=int(os.getenv("TE_MAX_PAYLOAD_AGE_SECONDS", "30")),
             ),
             intelligence=IntelligenceSettings(
                 state_buffer_rows=int(os.getenv("TE_STATE_BUFFER_ROWS", "4000")),
