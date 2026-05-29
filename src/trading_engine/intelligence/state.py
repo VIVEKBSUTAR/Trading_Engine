@@ -52,6 +52,7 @@ class StateConfig:
     volatility_high_threshold: float = 18.0
     signal_ttl_min_candles: int = 2
     signal_ttl_max_candles: int = 4
+    chop_probability_threshold: float = 0.68
 
 
 class MarketStateAggregator:
@@ -175,6 +176,7 @@ class MarketStateAggregator:
         option_bias = float(feature_map.get("option_chain_bias", 0.0) or 0.0)
         regime, regime_confidence, notes = self._classify_regime(feature_map, current_snapshot.spot_price)
         transition = self._classify_transition(regime, regime_confidence, feature_map, notes)
+        chop_probability = self._derive_chop_probability(feature_map, transition)
         trade_grade = self._grade_trade(feature_map, regime, trap_probability)
 
         state = MarketState(
@@ -193,6 +195,10 @@ class MarketStateAggregator:
             regime=regime,
             regime_confidence=regime_confidence,
             transition=transition,
+            chop_probability=chop_probability,
+            persistence_probability=transition.persistence_probability,
+            instability_probability=transition.instability_probability,
+            exhaustion_probability=transition.exhaustion_probability,
             quality_score=self._quality_score(feature_map, regime, trap_probability, current_snapshot.vix_value),
             trade_grade=trade_grade,
             session_quality=float(feature_map.get("session_quality", 0.5) or 0.5),
@@ -373,6 +379,10 @@ class MarketStateAggregator:
         compression = float(feature_map.get("1m_narrow_range_compression", 0.0) or 0.0)
         trend_strength = float(feature_map.get("1m_trend_strength", 0.0) or 0.0)
         reversal = float(feature_map.get("1m_reversal_probability", 0.0) or 0.0)
+        failed_breakout = float(feature_map.get("1m_failed_breakout_frequency", 0.0) or 0.0)
+        wick_rejection = float(feature_map.get("1m_wick_rejection", 0.0) or 0.0)
+        directional_persistence = float(feature_map.get("1m_directional_persistence", 0.5) or 0.5)
+        overlap = float(feature_map.get("1m_overlap_ratio", 0.0) or 0.0)
 
         if compression >= 0.6 and current_regime == MarketRegime.SIDEWAYS_COMPRESSION:
             stage = RegimeTransitionStage.COMPRESSION
@@ -384,11 +394,46 @@ class MarketStateAggregator:
             stage = RegimeTransitionStage.REVERSAL
         elif self._last_state is not None and self._last_state.regime in {MarketRegime.TREND_BULLISH, MarketRegime.TREND_BEARISH} and current_regime in {MarketRegime.EXHAUSTION_REVERSAL, MarketRegime.HIGH_NOISE_ENVIRONMENT}:
             stage = RegimeTransitionStage.EXHAUSTION
+        elif current_regime == MarketRegime.HIGH_NOISE_ENVIRONMENT and failed_breakout >= 0.45 and wick_rejection >= 0.45:
+            stage = RegimeTransitionStage.LIQUIDATION_PHASE
         else:
             stage = RegimeTransitionStage.SIDEWAYS if current_regime == MarketRegime.SIDEWAYS_COMPRESSION else RegimeTransitionStage.UNKNOWN
 
         path_notes = [f"transition:{previous.value}->{current_regime.value}", f"breakout:{breakout:.4f}", f"reversal:{reversal:.2f}"]
-        return MarketTransition(stage=stage, from_regime=previous, to_regime=current_regime, confidence=float(np.clip(confidence, 0.0, 0.99)), path=path_notes, reasons=list(reasons))
+        persistence_probability = float(np.clip(0.55 + directional_persistence * 0.35 - failed_breakout * 0.15, 0.0, 1.0))
+        instability_probability = float(np.clip(0.25 + overlap * 0.20 + failed_breakout * 0.30 + max(0.0, abs(breakout) * 50.0) * 0.10, 0.0, 1.0))
+        exhaustion_probability = float(np.clip(0.25 + wick_rejection * 0.30 + reversal * 0.35 + max(0.0, 1.0 - directional_persistence) * 0.20, 0.0, 1.0))
+        if stage == RegimeTransitionStage.LIQUIDATION_PHASE:
+            instability_probability = max(instability_probability, 0.75)
+        return MarketTransition(
+            stage=stage,
+            from_regime=previous,
+            to_regime=current_regime,
+            confidence=float(np.clip(confidence, 0.0, 0.99)),
+            persistence_probability=persistence_probability,
+            instability_probability=instability_probability,
+            exhaustion_probability=exhaustion_probability,
+            path=path_notes,
+            reasons=list(reasons),
+        )
+
+    def _derive_chop_probability(self, feature_map: dict[str, float], transition: MarketTransition) -> float:
+        overlap = float(feature_map.get("1m_overlap_ratio", 0.0) or 0.0)
+        failed_breakout = float(feature_map.get("1m_failed_breakout_frequency", 0.0) or 0.0)
+        persistence = float(feature_map.get("1m_directional_persistence", 0.5) or 0.5)
+        wick_rejection = float(feature_map.get("1m_wick_rejection", 0.0) or 0.0)
+        atr_compression = float(feature_map.get("1m_atr_compression", 0.0) or 0.0)
+        vwap_alignment = abs(float(feature_map.get("1m_vwap_alignment", 0.0) or 0.0))
+        chop_probability = (
+            0.25 * overlap
+            + 0.25 * failed_breakout
+            + 0.20 * max(0.0, 1.0 - persistence)
+            + 0.15 * wick_rejection
+            + 0.10 * atr_compression
+            + 0.05 * min(vwap_alignment * 100.0, 1.0)
+            + 0.10 * transition.instability_probability
+        )
+        return float(np.clip(chop_probability, 0.0, 1.0))
 
     def _derive_trap_probability(self, feature_map: dict[str, float]) -> float:
         wick = float(feature_map.get("1m_wick_rejection", 0.0) or 0.0)
@@ -404,8 +449,9 @@ class MarketStateAggregator:
         compression = float(feature_map.get("1m_narrow_range_compression", 0.0) or 0.0)
         liquidity = float(feature_map.get("1m_volume_expansion", 1.0) or 1.0)
         regime_bonus = 0.15 if regime in {MarketRegime.TREND_BULLISH, MarketRegime.TREND_BEARISH, MarketRegime.VOLATILE_EXPANSION} else -0.05
+        session_bonus = 0.08 if session_quality >= 0.8 else (-0.04 if session_quality < 0.5 else 0.0)
         vix_penalty = 0.08 if vix_value is not None and vix_value >= self._config.volatility_high_threshold else 0.0
-        score = 0.35 * session_quality + 0.25 * min(trend * 120.0, 1.0) + 0.15 * compression + 0.15 * min(liquidity / 1.25, 1.0) + regime_bonus - 0.4 * trap_probability - vix_penalty
+        score = 0.35 * session_quality + 0.25 * min(trend * 120.0, 1.0) + 0.15 * compression + 0.15 * min(liquidity / 1.25, 1.0) + regime_bonus + session_bonus - 0.4 * trap_probability - vix_penalty
         return float(np.clip(score, 0.0, 1.0))
 
     def _grade_trade(self, feature_map: dict[str, float], regime: MarketRegime, trap_probability: float) -> TradeGrade:

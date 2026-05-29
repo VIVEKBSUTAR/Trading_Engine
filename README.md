@@ -274,6 +274,40 @@ cp .env.example .env
 
 After that, fill in `.env` with your local values for Kite Connect, data paths, and intelligence tuning.
 
+## How To Run
+
+1. Activate the environment:
+
+```bash
+source .venv/bin/activate
+```
+
+2. Start the institutional dashboard:
+
+```bash
+te-dashboard
+```
+
+3. Start the live intelligence runtime:
+
+```bash
+te-intelligence
+```
+
+4. If you only want the authenticated Kite runtime:
+
+```bash
+te-kite-live
+```
+
+5. For a quick validation check before running live, compile the project:
+
+```bash
+PYTHONPATH=src:. .venv/bin/python -m compileall -q src broker config main.py
+```
+
+The dashboard is the best place to monitor the terminal-style market state view, signal ticket, alerts, open trade monitor, and option-chain intelligence. The live runtime is what refreshes the engine continuously.
+
 ## Commands
 
 The package exports these entrypoints:

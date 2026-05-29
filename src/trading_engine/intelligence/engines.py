@@ -25,6 +25,7 @@ from trading_engine.intelligence.models import (
     SessionPhase,
     StrikeResult,
     TradeGrade,
+    TrendState,
     RegimeTransitionStage,
     TrapResult,
 )
@@ -65,6 +66,8 @@ class SignalEngineConfig:
     confidence_floor: float = 0.60
     trap_cutoff: float = 0.60
     min_trade_quality: float = 0.55
+    chop_cutoff: float = 0.68
+    instability_cutoff: float = 0.65
 
 
 @dataclass(slots=True)
@@ -114,6 +117,17 @@ class MomentumPredictionEngine:
         feature_map = state.feature_snapshot
         evidence: list[str] = []
 
+        trend_regime = state.regime in {MarketRegime.TREND_BULLISH, MarketRegime.TREND_BEARISH}
+        compression_regime = state.regime == MarketRegime.SIDEWAYS_COMPRESSION or state.trend_state == TrendState.COMPRESSION
+        volatile_regime = state.regime in {MarketRegime.VOLATILE_EXPANSION, MarketRegime.HIGH_NOISE_ENVIRONMENT}
+        session_quality = float(feature_map.get("session_quality", state.session_quality) or 0.5)
+
+        trend_weight = self._weights.trend_strength * (1.35 if trend_regime else 1.0)
+        vwap_weight = self._weights.vwap_alignment * (1.20 if trend_regime else 1.0)
+        vol_support_weight = self._weights.volatility_support * (1.25 if compression_regime else (0.85 if volatile_regime else 1.0))
+        trap_weight = self._weights.trap_penalty * (1.25 if volatile_regime else 1.0)
+        session_weight = self._weights.session_quality * (1.15 if session_quality >= 0.8 else 0.9)
+
         trend_15 = float(feature_map.get("15m_trend_strength", 0.0) or 0.0)
         trend_5 = float(feature_map.get("5m_trend_strength", 0.0) or 0.0)
         trend_1 = float(feature_map.get("1m_trend_strength", 0.0) or 0.0)
@@ -130,26 +144,26 @@ class MomentumPredictionEngine:
         sideways_hint = float(feature_map.get("1m_narrow_range_compression", 0.0) or 0.0)
 
         bullish_score = (
-            self._weights.trend_strength * max(0.0, (trend_15 + trend_5 + trend_1) / 3.0 * 100.0)
-            + self._weights.vwap_alignment * max(0.0, (vwap_15 + vwap_5 + vwap_1) / 3.0 * 100.0)
+            trend_weight * max(0.0, (trend_15 + trend_5 + trend_1) / 3.0 * 100.0)
+            + vwap_weight * max(0.0, (vwap_15 + vwap_5 + vwap_1) / 3.0 * 100.0)
             + self._weights.oi_confirmation * max(0.0, oi_bias)
             + self._weights.volume_expansion * max(0.0, volume_expansion - 1.0)
-            + self._weights.session_quality * session_quality
-            + self._weights.volatility_support * volatility_support
+            + session_weight * session_quality
+            + vol_support_weight * volatility_support
             + self._weights.breakout_pressure * max(0.0, breakout_pressure * 100.0)
             + self._weights.momentum_persistence * persistence
-            - self._weights.trap_penalty * trap_penalty
+            - trap_weight * trap_penalty
         )
         bearish_score = (
-            self._weights.trend_strength * max(0.0, -(trend_15 + trend_5 + trend_1) / 3.0 * 100.0)
-            + self._weights.vwap_alignment * max(0.0, -(vwap_15 + vwap_5 + vwap_1) / 3.0 * 100.0)
+            trend_weight * max(0.0, -(trend_15 + trend_5 + trend_1) / 3.0 * 100.0)
+            + vwap_weight * max(0.0, -(vwap_15 + vwap_5 + vwap_1) / 3.0 * 100.0)
             + self._weights.oi_confirmation * max(0.0, -oi_bias)
             + self._weights.volume_expansion * max(0.0, volume_expansion - 1.0)
-            + self._weights.session_quality * session_quality
-            + self._weights.volatility_support * volatility_support
+            + session_weight * session_quality
+            + vol_support_weight * volatility_support
             + self._weights.breakout_pressure * max(0.0, -breakout_pressure * 100.0)
             + self._weights.momentum_persistence * persistence
-            - self._weights.trap_penalty * trap_penalty
+            - trap_weight * trap_penalty
         )
         sideways_score = (
             self._weights.sideways_compression * max(0.0, sideways_hint)
@@ -160,7 +174,7 @@ class MomentumPredictionEngine:
             + 0.10 * trap_penalty
         )
 
-        if state.regime in {MarketRegime.SIDEWAYS_COMPRESSION, MarketRegime.HIGH_NOISE_ENVIRONMENT}:
+        if state.regime in {MarketRegime.SIDEWAYS_COMPRESSION, MarketRegime.HIGH_NOISE_ENVIRONMENT} or state.chop_probability >= 0.68:
             sideways_score += 0.35
             evidence.append("regime favors low participation")
         if state.regime in {MarketRegime.TREND_BULLISH, MarketRegime.TREND_BEARISH}:
@@ -173,6 +187,9 @@ class MomentumPredictionEngine:
         if state.transition.stage == RegimeTransitionStage.REVERSAL:
             sideways_score += 0.15
             evidence.append("reversal stage increases caution")
+        if state.transition.stage == RegimeTransitionStage.LIQUIDATION_PHASE:
+            sideways_score += 0.20
+            evidence.append("liquidation phase suppresses participation")
 
         bullish_probability, bearish_probability, sideways_probability = _softmax([bullish_score, bearish_score, sideways_score])
         confidence = float(max(bullish_probability, bearish_probability, sideways_probability))
@@ -278,6 +295,10 @@ class SignalGenerationEngine:
 
         if trap.trap_score >= self._config.trap_cutoff or state.trade_grade == TradeGrade.AVOID:
             reasons.append("trap or trade grade filter rejected entry")
+            return self._neutral_signal(state, regime, probabilities, trap, close, reasons)
+
+        if state.chop_probability >= self._config.chop_cutoff or state.instability_probability >= self._config.instability_cutoff:
+            reasons.append("chop or instability filter rejected entry")
             return self._neutral_signal(state, regime, probabilities, trap, close, reasons)
 
         if state.regime in {MarketRegime.SIDEWAYS_COMPRESSION, MarketRegime.HIGH_NOISE_ENVIRONMENT}:

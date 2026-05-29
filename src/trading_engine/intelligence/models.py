@@ -97,6 +97,7 @@ class RegimeTransitionStage(StrEnum):
     TREND_EXPANSION = "trend_expansion"
     EXHAUSTION = "exhaustion"
     REVERSAL = "reversal"
+    LIQUIDATION_PHASE = "liquidation_phase"
     UNKNOWN = "unknown"
 
 
@@ -149,6 +150,9 @@ class MarketTransition:
     from_regime: MarketRegime
     to_regime: MarketRegime
     confidence: float
+    persistence_probability: float = 0.0
+    instability_probability: float = 0.0
+    exhaustion_probability: float = 0.0
     path: list[str] = field(default_factory=list)
     reasons: list[str] = field(default_factory=list)
 
@@ -172,6 +176,10 @@ class MarketState:
     regime: MarketRegime
     regime_confidence: float
     transition: MarketTransition
+    chop_probability: float
+    persistence_probability: float
+    instability_probability: float
+    exhaustion_probability: float
     quality_score: float
     trade_grade: TradeGrade
     session_quality: float
