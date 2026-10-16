@@ -132,6 +132,8 @@ class IntelligenceSettings:
     time_stop_minutes: int = 12
     signal_ttl_min_candles: int = 2
     signal_ttl_max_candles: int = 4
+    max_spread_percentage: float = 0.05
+    max_implied_volatility_percentile: float = 0.90
 
 
 @dataclass(slots=True)
@@ -256,6 +258,8 @@ class AppSettings:
                 time_stop_minutes=int(os.getenv("TE_TIME_STOP_MINUTES", "12")),
                 signal_ttl_min_candles=int(os.getenv("TE_SIGNAL_TTL_MIN_CANDLES", "2")),
                 signal_ttl_max_candles=int(os.getenv("TE_SIGNAL_TTL_MAX_CANDLES", "4")),
+                max_spread_percentage=float(os.getenv("TE_MAX_SPREAD_PERCENTAGE", "0.05")),
+                max_implied_volatility_percentile=float(os.getenv("TE_MAX_IMPLIED_VOLATILITY_PERCENTILE", "0.90")),
             ),
             risk=RiskSettings(
                 capital=float(os.getenv("TE_CAPITAL", "10000000")),

@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime
+from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -11,13 +13,7 @@ from loguru import logger
 
 from broker.kite_client import LiveMarketSnapshot, MarketQuote
 from broker.normalizer import NormalizedTickBatch
-from trading_engine.features.options_analytics import (
-    compute_dealer_positioning_proxy,
-    compute_max_pain,
-    compute_oi_imbalance,
-    compute_put_call_ratio,
-    compute_strike_concentration_zones,
-)
+from storage.parquet_writer import ParquetWriter
 from trading_engine.intelligence.features import build_live_features
 from trading_engine.intelligence.models import (
     DirectionalBias,
@@ -58,14 +54,41 @@ class StateConfig:
 class MarketStateAggregator:
     """Maintain rolling live state from broker and NSE market feeds."""
 
-    def __init__(self, config: StateConfig | None = None) -> None:
+    def __init__(
+        self,
+        config: StateConfig | None = None,
+        parquet_writer: ParquetWriter | None = None,
+    ) -> None:
         self._config = config or StateConfig()
+        if parquet_writer is not None:
+            self._parquet_writer = parquet_writer
+        else:
+            try:
+                self._parquet_writer = ParquetWriter()
+            except Exception:
+                self._parquet_writer = None
         self._spot_history = pd.DataFrame()
         self._vix_history = pd.DataFrame()
         self._option_chain = pd.DataFrame()
         self._ticks = pd.DataFrame()
         self._last_snapshot: MarketSnapshotBundle | None = None
         self._last_state: MarketState | None = None
+        # Per-token tick buffers for ATM CE and PE premium tracking
+        self._atm_ce_token: int | None = None
+        self._atm_pe_token: int | None = None
+        self._atm_ce_ticks: pd.DataFrame = pd.DataFrame()
+        self._atm_pe_ticks: pd.DataFrame = pd.DataFrame()
+        # Dictionary buffer to store live ticks for specific option instrument tokens
+        self._option_token_ticks: dict[int, pd.DataFrame] = {}
+
+    @property
+    def parquet_writer(self) -> ParquetWriter | None:
+        """Expose the parquet writer instance."""
+        return self._parquet_writer
+
+    @parquet_writer.setter
+    def parquet_writer(self, writer: ParquetWriter | None) -> None:
+        self._parquet_writer = writer
 
     def update_spot(self, quote: MarketQuote) -> None:
         row = pd.DataFrame(
@@ -118,6 +141,157 @@ class MarketStateAggregator:
         working = batch.frame.copy()
         self._ticks = self._append_and_trim(self._ticks, working, self._config.max_tick_rows)
         logger.debug("Updated tick history", rows=len(self._ticks))
+
+        # Route option-token ticks into per-token ATM buffers
+        if self._atm_ce_token is not None and "instrument_token" in working.columns:
+            ce_rows = working.loc[working["instrument_token"] == self._atm_ce_token]
+            if not ce_rows.empty:
+                self._atm_ce_ticks = self._append_and_trim(self._atm_ce_ticks, ce_rows, 5000)
+        if self._atm_pe_token is not None and "instrument_token" in working.columns:
+            pe_rows = working.loc[working["instrument_token"] == self._atm_pe_token]
+            if not pe_rows.empty:
+                self._atm_pe_ticks = self._append_and_trim(self._atm_pe_ticks, pe_rows, 5000)
+
+        # Route option-token ticks into dictionary buffer for tracked tokens
+        if "instrument_token" in working.columns:
+            for token, group in working.groupby("instrument_token"):
+                token_int = int(token)
+                if token_int in self._option_token_ticks or token_int in {self._atm_ce_token, self._atm_pe_token}:
+                    if token_int not in self._option_token_ticks:
+                        self._option_token_ticks[token_int] = pd.DataFrame()
+                    self._option_token_ticks[token_int] = pd.concat(
+                        [self._option_token_ticks[token_int], group], ignore_index=True
+                    )
+                    self._check_and_flush_buffer(token_int)
+
+    def set_atm_tokens(self, ce_token: int | None, pe_token: int | None) -> None:
+        """Declare which instrument tokens correspond to the ATM CE and PE strikes."""
+        self._atm_ce_token = ce_token
+        self._atm_pe_token = pe_token
+        logger.info("ATM tokens updated", ce_token=ce_token, pe_token=pe_token)
+
+    def update_option_ticks(self, instrument_token: int, tick_row: pd.DataFrame) -> None:
+        """Route a single-instrument tick into the correct ATM buffer and token dictionary buffer."""
+        token = int(instrument_token)
+        if token == self._atm_ce_token:
+            self._atm_ce_ticks = self._append_and_trim(self._atm_ce_ticks, tick_row, 5000)
+        elif token == self._atm_pe_token:
+            self._atm_pe_ticks = self._append_and_trim(self._atm_pe_ticks, tick_row, 5000)
+
+        if token not in self._option_token_ticks:
+            self._option_token_ticks[token] = pd.DataFrame()
+        self._option_token_ticks[token] = pd.concat([self._option_token_ticks[token], tick_row], ignore_index=True)
+        self._check_and_flush_buffer(token)
+
+    def get_option_tick_buffers(self) -> tuple[pd.DataFrame, pd.DataFrame]:
+        """Return (atm_ce_ticks, atm_pe_ticks) DataFrames for feature computation."""
+        return self._atm_ce_ticks.copy(), self._atm_pe_ticks.copy()
+
+    def push_option_tick(
+        self,
+        instrument_token: int,
+        bid: float,
+        ask: float,
+        timestamp: datetime | None = None,
+        last_price: float | None = None,
+    ) -> None:
+        """Push incoming websocket bid and ask ticks into this specific token buffer."""
+        ts = timestamp or utcnow()
+        token = int(instrument_token)
+        lp = float(last_price) if last_price is not None else float((float(bid) + float(ask)) / 2.0)
+        row = pd.DataFrame(
+            [
+                {
+                    "timestamp": ts,
+                    "instrument_token": token,
+                    "bid_price": float(bid),
+                    "ask_price": float(ask),
+                    "last_price": lp,
+                }
+            ]
+        )
+        if token not in self._option_token_ticks:
+            self._option_token_ticks[token] = pd.DataFrame()
+        self._option_token_ticks[token] = pd.concat([self._option_token_ticks[token], row], ignore_index=True)
+        self._check_and_flush_buffer(token)
+        logger.debug("Pushed option tick to token buffer", token=token, bid=bid, ask=ask)
+
+    def _check_and_flush_buffer(self, token: int) -> Path | None:
+        """Check if option token buffer exceeds 5000 rows and flush to Parquet if so."""
+        token_int = int(token)
+        df = self._option_token_ticks.get(token_int)
+        if df is not None and len(df) > 5000:
+            return self.flush_option_token_buffer(token_int)
+        return None
+
+    def flush_option_token_buffer(self, token: int) -> Path | None:
+        """Write raw bid and ask ticks for an option token to Parquet and clear that specific buffer."""
+        token_int = int(token)
+        df = self._option_token_ticks.get(token_int)
+        if df is None or df.empty:
+            return None
+
+        flush_data = df.copy()
+        path: Path | None = None
+        if self._parquet_writer is not None:
+            try:
+                path = self._parquet_writer.write_option_ticks(flush_data)
+            except Exception as exc:  # noqa: BLE001
+                logger.error("Failed to flush option token buffer to parquet", token=token_int, error=str(exc))
+
+        # Clear that specific buffer
+        self._option_token_ticks[token_int] = pd.DataFrame()
+        logger.info(
+            "Flushed option token buffer to Parquet",
+            instrument_token=token_int,
+            rows=len(flush_data),
+            path=str(path) if path else None,
+        )
+        return path
+
+    def flush_all_option_token_buffers(self) -> dict[int, Path | None]:
+        """Flush all non-empty option token buffers to Parquet and clear them."""
+        results: dict[int, Path | None] = {}
+        for token in list(self._option_token_ticks.keys()):
+            results[token] = self.flush_option_token_buffer(token)
+        return results
+
+    def push_option_bid_ask_tick(
+        self,
+        instrument_token: int,
+        bid: float,
+        ask: float,
+        timestamp: datetime | None = None,
+        last_price: float | None = None,
+    ) -> None:
+        """Alias for push_option_tick."""
+        self.push_option_tick(instrument_token, bid, ask, timestamp=timestamp, last_price=last_price)
+
+    @property
+    def option_token_ticks(self) -> dict[int, pd.DataFrame]:
+        """Dictionary buffer of live ticks keyed by option instrument token."""
+        return self._option_token_ticks
+
+    def get_option_token_ticks(self, instrument_token: int | None = None) -> dict[int, pd.DataFrame] | pd.DataFrame:
+        """Return the dictionary buffer of option ticks, or a specific token's DataFrame."""
+        if instrument_token is not None:
+            return self._option_token_ticks.get(int(instrument_token), pd.DataFrame()).copy()
+        return {k: v.copy() for k, v in self._option_token_ticks.items()}
+
+    def get_latest_option_tick(self, instrument_token: int) -> dict[str, Any] | None:
+        """Return the most recent bid/ask tick for an instrument token, if available."""
+        token = int(instrument_token)
+        df = self._option_token_ticks.get(token)
+        if df is None or df.empty:
+            return None
+        last_row = df.iloc[-1]
+        return {
+            "timestamp": last_row.get("timestamp"),
+            "bid_price": float(last_row.get("bid_price", 0.0) or 0.0),
+            "ask_price": float(last_row.get("ask_price", 0.0) or 0.0),
+            "last_price": float(last_row.get("last_price", 0.0) or 0.0),
+            "instrument_token": token,
+        }
 
     def update_from_snapshot(self, snapshot: LiveMarketSnapshot | MarketSnapshotBundle, option_chain: pd.DataFrame | None = None) -> None:
         if hasattr(snapshot, "nifty_spot") and hasattr(snapshot, "india_vix"):
@@ -373,7 +547,6 @@ class MarketStateAggregator:
         reasons: list[str],
     ) -> MarketTransition:
         previous = self._last_state.regime if self._last_state is not None else current_regime
-        path = [previous.value, current_regime.value]
         stage = RegimeTransitionStage.UNKNOWN
         breakout = float(feature_map.get("1m_breakout_pressure", 0.0) or 0.0)
         compression = float(feature_map.get("1m_narrow_range_compression", 0.0) or 0.0)

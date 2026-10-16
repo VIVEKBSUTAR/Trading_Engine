@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pandas as pd
@@ -15,10 +15,48 @@ from config.settings import StorageSettings
 
 
 class ParquetWriter:
-    """Write raw JSON snapshots and processed partitioned parquet datasets."""
+    """Write raw JSON snapshots, processed datasets, and raw option ticks partitioned datasets."""
 
-    def __init__(self, settings: StorageSettings) -> None:
+    def __init__(self, settings: StorageSettings | None = None) -> None:
+        if settings is None:
+            from config.settings import AppSettings
+            settings = AppSettings.from_env().storage
         self._settings = settings
+
+    def write_option_ticks(self, frame: pd.DataFrame, dataset_name: str = "option_ticks") -> Path:
+        """Persist raw option bid/ask ticks as a partitioned parquet dataset organized by date and instrument token."""
+        if frame.empty:
+            raise ValueError("Cannot write empty option ticks frame")
+
+        working = frame.copy()
+        if "timestamp" in working.columns:
+            ts_series = pd.to_datetime(working["timestamp"], utc=True)
+            working["date"] = ts_series.dt.strftime("%Y-%m-%d")
+        elif "date" not in working.columns:
+            working["date"] = datetime.now(UTC).strftime("%Y-%m-%d")
+
+        if "instrument_token" in working.columns:
+            working["instrument_token"] = working["instrument_token"].astype(str)
+
+        dataset_root = self._settings.processed_dir / dataset_name
+        dataset_root.mkdir(parents=True, exist_ok=True)
+
+        table = pa.Table.from_pandas(working, preserve_index=False)
+        ds.write_dataset(
+            data=table,
+            base_dir=str(dataset_root),
+            format="parquet",
+            partitioning=["date", "instrument_token"],
+            existing_data_behavior="overwrite_or_ignore",
+            basename_template="part-{i}.parquet",
+        )
+
+        logger.info(
+            "Option ticks parquet write complete",
+            dataset=str(dataset_root),
+            rows=len(working),
+        )
+        return dataset_root
 
     def write_raw_snapshot(self, raw_text: str, fetched_at: datetime, source: str = "nse") -> Path:
         """Persist unmodified raw API response to JSON file by date partitions."""

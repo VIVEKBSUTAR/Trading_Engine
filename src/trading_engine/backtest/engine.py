@@ -5,15 +5,16 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import backtrader as bt
+import numpy as np
 import pandas as pd
 
 from trading_engine.backtest.metrics import BacktestMetrics, compute_backtest_metrics
 
 
 class SignalPandasData(bt.feeds.PandasData):
-	"""Pandas feed exposing model signal/confidence lines."""
+	"""Pandas feed exposing model signal/confidence lines and optional ask price."""
 
-	lines = ("signal_long", "signal_short", "confidence")
+	lines = ("signal_long", "signal_short", "confidence", "ask_price")
 	params = (
 		("datetime", None),
 		("open", "open"),
@@ -25,6 +26,7 @@ class SignalPandasData(bt.feeds.PandasData):
 		("signal_long", "signal_long"),
 		("signal_short", "signal_short"),
 		("confidence", "confidence"),
+		("ask_price", -1),
 	)
 
 
@@ -44,39 +46,57 @@ class DirectionalSignalStrategy(bt.Strategy):
 		self._entry_price = None
 		self._entry_size = 0
 		self._pending_order = None
+		self._pending_signal: str | None = None
+		self._pending_signal_bar: int | None = None
 		# ledger of executed trades with detailed accounting
 		self.trades: list[dict] = []
 
+	def _fetch_entry_ask_price(self) -> float:
+		"""Fetch entry ask price from the option chain tick at time T+1."""
+		if hasattr(self.data, "ask_price"):
+			try:
+				val = float(self.data.ask_price[0])
+				if not np.isnan(val) and val > 0:
+					return val
+			except Exception:
+				pass
+		if hasattr(self.data, "ask"):
+			try:
+				val = float(self.data.ask[0])
+				if not np.isnan(val) and val > 0:
+					return val
+			except Exception:
+				pass
+		if hasattr(self.data, "open"):
+			try:
+				val = float(self.data.open[0])
+				if not np.isnan(val) and val > 0:
+					return val
+			except Exception:
+				pass
+		return float(self.data.close[0])
+
 	def next(self) -> None:
-		confidence = float(self.data.confidence[0])
-		signal_long = int(self.data.signal_long[0])
-		signal_short = int(self.data.signal_short[0])
 		close_price = float(self.data.close[0])
 
-		if not self.position:
-			if confidence < self.params.confidence_threshold:
-				return
-
-			if signal_long == 1:
-				# place market order and store tentative entry info; actual price
-				# is recorded at the time of close (we assume immediate fill at close)
-				self._entry_bar = len(self)
-				self._entry_price = close_price
-				self._entry_size = 1
+		# 1. Execute any pending signal generated at time T using the T+1 option chain tick ask price
+		if not self.position and self._pending_signal is not None:
+			entry_ask = self._fetch_entry_ask_price()
+			self._entry_bar = len(self)
+			self._entry_price = entry_ask
+			self._entry_size = 1
+			if self._pending_signal == "long":
 				self.buy()
-				return
-
-			if signal_short == 1:
-				self._entry_bar = len(self)
-				self._entry_price = close_price
-				self._entry_size = 1
+			elif self._pending_signal == "short":
 				self.sell()
-				return
+			self._pending_signal = None
+			self._pending_signal_bar = None
+			return
 
+		# 2. Manage existing position
 		if self.position and self._entry_bar is not None and self._entry_price is not None:
 			holding_bars = len(self) - self._entry_bar
 			if holding_bars >= self.params.max_holding_bars:
-				# compute exit accounting before closing
 				self._record_and_close(exit_price=close_price)
 				return
 
@@ -88,6 +108,26 @@ class DirectionalSignalStrategy(bt.Strategy):
 				stop_price = self._entry_price * (1.0 + self.params.stop_loss_pct)
 				if close_price >= stop_price:
 					self._record_and_close(exit_price=close_price)
+			return
+
+		# 3. Process new signal at current time T (queue execution for time T+1 to eliminate lookahead bias)
+		if not self.position and self._pending_signal is None:
+			confidence = float(self.data.confidence[0])
+			signal_long = int(self.data.signal_long[0])
+			signal_short = int(self.data.signal_short[0])
+
+			if confidence < self.params.confidence_threshold:
+				return
+
+			if signal_long == 1:
+				self._pending_signal = "long"
+				self._pending_signal_bar = len(self)
+				return
+
+			if signal_short == 1:
+				self._pending_signal = "short"
+				self._pending_signal_bar = len(self)
+				return
 
 	def _record_and_close(self, *, exit_price: float) -> None:
 		"""Record trade details applying conservative slippage and commission, then close position."""
@@ -182,7 +222,9 @@ def run_directional_backtest(
 	if missing:
 		raise ValueError(f"Missing columns for backtest: {sorted(missing)}")
 
-	market = frame.copy().sort_values(datetime_col).set_index(datetime_col)
+	market = frame.copy().sort_values(datetime_col).reset_index(drop=True)
+	
+	market = market.set_index(datetime_col)
 
 	cerebro = bt.Cerebro(stdstats=False)
 	data_feed = SignalPandasData(dataname=market)

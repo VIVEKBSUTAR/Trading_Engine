@@ -113,8 +113,8 @@ def build_execution_instructions(
 		close_price = float(getattr(row, price_col))
 		confidence = float(getattr(row, confidence_col))
 		regime = str(getattr(row, regime_col))
-		signal_long = int(getattr(row, "signal_long"))
-		signal_short = int(getattr(row, "signal_short"))
+		signal_long = int(row.signal_long)
+		signal_short = int(row.signal_short)
 
 		if signal_long == 0 and signal_short == 0:
 			continue

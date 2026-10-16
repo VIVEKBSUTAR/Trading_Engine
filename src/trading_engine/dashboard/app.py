@@ -125,8 +125,23 @@ def _render_header_strip(report: IntelligenceReport) -> None:
     r2[1].metric("Trend Strength", f"{report.state.trend_strength:+.3f}")
     r2[2].metric("Volatility State", report.state.volatility_state.value.replace("_", " ").title())
     r2[3].metric("Market Quality", report.state.trade_grade.value, delta=f"Chop {report.state.chop_probability:.0%}")
+
+    # Latency and Trap/Risk metadata strip
+    lat_text = "N/A"
+    if report.latency is not None:
+        lat_text = f"Total: {report.latency.total_latency_ms:.1f}ms (Feat: {report.latency.feature_latency_ms:.1f}ms | Sig: {report.latency.signal_latency_ms:.1f}ms)"
+    
+    # Classify trap risk label
+    trap_prob = report.state.trap_probability
+    if trap_prob >= 0.65:
+        trap_label = "HIGH RISK"
+    elif trap_prob >= 0.35:
+        trap_label = "MEDIUM RISK"
+    else:
+        trap_label = "LOW RISK"
+
     st.markdown(
-        f"<div class='terminal-note'>Trap {report.state.trap_probability:.0%} | Persistence {report.state.persistence_probability:.0%} | Exhaustion {report.state.exhaustion_probability:.0%} | Instability {report.state.instability_probability:.0%}</div>",
+        f"<div class='terminal-note'>Processing Latency: <b>{lat_text}</b> | Trap: <b>{trap_label} ({trap_prob:.0%})</b> | Persistence {report.state.persistence_probability:.0%} | Exhaustion {report.state.exhaustion_probability:.0%} | Instability {report.state.instability_probability:.0%}</div>",
         unsafe_allow_html=True,
     )
 
@@ -147,6 +162,23 @@ def _render_market_intelligence_panel(report: IntelligenceReport) -> None:
     stats[1].metric("Liquidity State", report.state.liquidity_state.value.replace("_", " ").title())
     stats[2].metric("Breakout Quality", f"{abs(report.state.breakout_pressure):.3f}")
     stats[3].metric("Trend Quality", report.state.trend_state.value.replace("_", " ").title())
+
+    # Premium Velocity indicators
+    def get_velocity_label(vel: float) -> str:
+        if pd.isna(vel) or vel == 0.0:
+            return "FLAT"
+        if vel > 0.005:
+            return "ACCELERATING" if vel > 0.012 else "RISING"
+        if vel < -0.005:
+            return "DECELERATING"
+        return "FLAT"
+
+    ce_vel_label = get_velocity_label(report.ce_premium_velocity)
+    pe_vel_label = get_velocity_label(report.pe_premium_velocity)
+
+    vel_cols = st.columns(2)
+    vel_cols[0].metric("ATM CE Velocity", ce_vel_label, f"Score: {report.ce_score:.1f}/10")
+    vel_cols[1].metric("ATM PE Velocity", pe_vel_label, f"Score: {report.pe_score:.1f}/10")
 
     st.caption(
         "Evidence: " + (", ".join(report.probabilities.evidence[-4:]) if report.probabilities.evidence else "None")
@@ -234,9 +266,22 @@ def _render_signal_terminal(report: IntelligenceReport) -> None:
     ticket_cols[1].write(f"Entry Zone: **{_entry_zone(report)}**")
     ticket_cols[0].write(f"Stoploss: **{_price_text(report.signal.stop_loss)}**")
     ticket_cols[1].write(f"Targets: **{_target_ladder(report)}**")
-    ticket_cols[0].write(f"Signal TTL: **{report.signal.signal_ttl_candles or report.state.signal_ttl_candles} candles**")
+    
+    # Signal countdown in seconds
+    age_sec = report.signal.signal_age_seconds()
+    val_sec = report.signal.signal_validity_seconds
+    time_str = "N/A"
+    if pd.notna(age_sec) and pd.notna(val_sec):
+        rem_sec = max(0, int(val_sec - age_sec))
+        time_str = f"{rem_sec}s remaining (Age: {int(age_sec)}s)"
+        
+    ticket_cols[0].write(f"Signal Validity: **{time_str}**")
     ticket_cols[1].write(f"Trade Grade: **{report.signal.trade_grade.value}** | Risk Profile: **{_risk_profile(report)}**")
     st.write(f"Expected Move Horizon: **{report.probabilities.horizon_minutes}-{report.probabilities.horizon_minutes + 11} minutes**")
+    
+    if report.signal.score is not None:
+        st.write(f"Composite Score: **{report.signal.score.total:.2f}/10** ({report.signal.score.label()})")
+
     st.markdown(f"**Action:** { _action_text(report) }")
     st.markdown("**Reason**")
     for reason in _signal_reasons(report):

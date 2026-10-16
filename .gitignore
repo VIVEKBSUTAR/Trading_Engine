@@ -20,3 +20,12 @@ logs/**/*.log
 # Local research datasets and generated benchmark outputs
 dataset/
 outputs/
+
+# CodeLens Graph local index
+.codelens/
+
+# Coverage and build artifacts
+.coverage
+*.egg-info/
+data/cache/*.txt
+data/cache/**/*.duckdb

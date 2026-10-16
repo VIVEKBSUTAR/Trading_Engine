@@ -2,32 +2,29 @@
 
 from __future__ import annotations
 
+import itertools
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import timedelta
 from math import exp
-from typing import Iterable
 
 import numpy as np
 import pandas as pd
 
 from trading_engine.intelligence.models import (
-    DirectionalBias,
     MarketRegime,
     MarketState,
-    MarketTransition,
-    MomentumState,
     OptionSide,
     ProbabilityResult,
     RegimeResult,
+    RegimeTransitionStage,
     RiskResult,
     SignalAction,
     SignalResult,
-    SessionPhase,
     StrikeResult,
     TradeGrade,
-    TrendState,
-    RegimeTransitionStage,
     TrapResult,
+    TrendState,
 )
 
 
@@ -68,6 +65,8 @@ class SignalEngineConfig:
     min_trade_quality: float = 0.55
     chop_cutoff: float = 0.68
     instability_cutoff: float = 0.65
+    max_spread_percentage: float = 0.05
+    max_implied_volatility_percentile: float = 0.90
 
 
 @dataclass(slots=True)
@@ -276,6 +275,154 @@ class SignalGenerationEngine:
 
     def __init__(self, config: SignalEngineConfig | None = None) -> None:
         self._config = config or SignalEngineConfig()
+        self._historical_iv: dict[tuple[float, str], list[float]] = {}
+        self._signal_counter = itertools.count(1)
+
+    def extract_strike_quote(
+        self,
+        strike: float,
+        side: OptionSide | str,
+        option_chain: pd.DataFrame,
+    ) -> tuple[float | None, float | None, float | None]:
+        """Extract best bid, best ask, and implied volatility for a strike and side."""
+        if option_chain is None or option_chain.empty:
+            return None, None, None
+
+        side_str = side.value.upper() if isinstance(side, OptionSide) else str(side).upper()
+        working = option_chain.copy()
+
+        if "option_type" in working.columns:
+            working = working.loc[working["option_type"].astype(str).str.upper() == side_str]
+        if "strike" in working.columns:
+            working = working.loc[pd.to_numeric(working["strike"], errors="coerce") == float(strike)]
+
+        if working.empty:
+            return None, None, None
+
+        if "expiry" in working.columns:
+            working = working.sort_values("expiry")
+
+        row = working.iloc[0]
+        bid = _safe_float(row.get("bid_price") or row.get("bid") or row.get("best_bid"))
+        ask = _safe_float(row.get("ask_price") or row.get("ask") or row.get("best_ask") or row.get("last_price"))
+        iv = _safe_float(row.get("iv") or row.get("implied_volatility") or row.get("implied_vol"))
+
+        return bid, ask, iv
+
+    def calculate_spread_percentage(self, bid: float, ask: float) -> float | None:
+        """Calculate spread percentage: (ask - bid) / bid."""
+        if bid <= 0.0 or ask <= 0.0:
+            return None
+        return float((ask - bid) / bid)
+
+    def check_liquidity_filter(
+        self,
+        strike: float,
+        side: OptionSide | str,
+        option_chain: pd.DataFrame,
+    ) -> tuple[bool, float | None, str | None]:
+        """Verify the selected strike spread percentage does not exceed max_spread_percentage (default 0.05)."""
+        bid, ask, _ = self.extract_strike_quote(strike, side, option_chain)
+        if bid is None or ask is None:
+            return True, None, None
+
+        spread_pct = self.calculate_spread_percentage(bid, ask)
+        if spread_pct is None:
+            return False, None, "liquidity filter: non-positive bid/ask quote"
+
+        if spread_pct > self._config.max_spread_percentage:
+            return (
+                False,
+                spread_pct,
+                f"liquidity filter: spread {spread_pct:.4f} ({spread_pct * 100:.2f}%) exceeds "
+                f"max allowed {self._config.max_spread_percentage:.2f} ({self._config.max_spread_percentage * 100:.1f}%) penalty",
+            )
+
+        return True, spread_pct, None
+
+    def check_volatility_filter(
+        self,
+        strike: float,
+        side: OptionSide | str,
+        option_chain: pd.DataFrame,
+        historical_iv_window: pd.Series | list[float] | None = None,
+    ) -> tuple[bool, float | None, float | None, str | None]:
+        """Verify implied volatility is below max_implied_volatility_percentile (default 90th percentile)."""
+        _, _, current_iv = self.extract_strike_quote(strike, side, option_chain)
+        if current_iv is None:
+            return True, None, None, None
+
+        side_str = side.value.upper() if isinstance(side, OptionSide) else str(side).upper()
+        key = (float(strike), side_str)
+
+        history: list[float] = []
+        if historical_iv_window is not None:
+            if isinstance(historical_iv_window, pd.Series):
+                history = [float(v) for v in historical_iv_window.dropna().tolist()]
+            else:
+                history = [float(v) for v in historical_iv_window if v is not None and not np.isnan(v)]
+        else:
+            history = list(self._historical_iv.get(key, []))
+
+        # Record current observation in internal rolling window (keep up to 100 observations)
+        buf = self._historical_iv.setdefault(key, [])
+        buf.append(current_iv)
+        if len(buf) > 100:
+            self._historical_iv[key] = buf[-100:]
+
+        if len(history) < 2:
+            return True, current_iv, None, None
+
+        hist_arr = np.array(history, dtype=float)
+        percentile = float(np.mean(hist_arr <= current_iv))
+
+        if (
+            percentile >= self._config.max_implied_volatility_percentile
+            or current_iv >= float(np.percentile(hist_arr, self._config.max_implied_volatility_percentile * 100.0))
+        ):
+            return (
+                False,
+                current_iv,
+                percentile,
+                f"volatility filter: iv {current_iv:.4f} is at {percentile * 100:.1f}th percentile "
+                f"(>= {self._config.max_implied_volatility_percentile * 100:.0f}th percentile) of rolling window - crush risk",
+            )
+
+        return True, current_iv, percentile, None
+
+    def _resolve_candidate_strike(
+        self,
+        state: MarketState,
+        action: SignalAction,
+        confidence: float,
+        option_chain: pd.DataFrame | None,
+        selected_strike: StrikeResult | float | None,
+    ) -> StrikeResult | None:
+        if isinstance(selected_strike, StrikeResult):
+            return selected_strike
+        if isinstance(selected_strike, (int, float)):
+            side = OptionSide.CE if action == SignalAction.BUY_CE else OptionSide.PE
+            return StrikeResult(
+                option_side=side,
+                strike=float(selected_strike),
+                expiry=None,
+                moneyness="atm",
+            )
+        if option_chain is not None and not option_chain.empty:
+            provisional = SignalResult(
+                action=action,
+                confidence=confidence,
+                regime=state.regime,
+                probability=ProbabilityResult(0.0, 0.0, 0.0, confidence, 4),
+                trap=TrapResult(0.0, 0.0, 0.0, 0.0),
+                entry_reference=None,
+                stop_loss=None,
+                target=None,
+                strike=None,
+                quantity=0,
+            )
+            return StrikeSelectionEngine().select(state, provisional, option_chain)
+        return None
 
     def generate(
         self,
@@ -284,6 +431,9 @@ class SignalGenerationEngine:
         probabilities: ProbabilityResult,
         trap: TrapResult,
         regime: RegimeResult,
+        selected_strike: StrikeResult | float | None = None,
+        option_chain: pd.DataFrame | None = None,
+        historical_iv_window: pd.Series | list[float] | None = None,
     ) -> SignalResult:
         feature_map = state.feature_snapshot
         close = _safe_float(feature_map.get("close")) or _safe_float(feature_map.get("1m_close"))
@@ -309,24 +459,68 @@ class SignalGenerationEngine:
             reasons.append("trade quality below minimum")
             return self._neutral_signal(state, regime, probabilities, trap, close, reasons)
 
-        if probabilities.bullish_probability >= self._config.bullish_threshold and probabilities.bullish_probability > probabilities.bearish_probability:
-            reasons.append("bullish probability dominates")
-            return self._build_directional_signal(
-                action=SignalAction.BUY_CE,
-                confidence=probabilities.bullish_probability,
+        is_bullish = probabilities.bullish_probability >= self._config.bullish_threshold and probabilities.bullish_probability > probabilities.bearish_probability
+        is_bearish = probabilities.bearish_probability >= self._config.bearish_threshold and probabilities.bearish_probability > probabilities.bullish_probability
+
+        if is_bullish or is_bearish:
+            target_action = SignalAction.BUY_CE if is_bullish else SignalAction.BUY_PE
+            target_side = OptionSide.CE if is_bullish else OptionSide.PE
+            target_conf = probabilities.bullish_probability if is_bullish else probabilities.bearish_probability
+
+            candidate_strike = self._resolve_candidate_strike(
                 state=state,
-                regime=regime,
-                probabilities=probabilities,
-                trap=trap,
-                close=close,
-                reasons=reasons,
+                action=target_action,
+                confidence=target_conf,
+                option_chain=option_chain,
+                selected_strike=selected_strike,
             )
 
-        if probabilities.bearish_probability >= self._config.bearish_threshold and probabilities.bearish_probability > probabilities.bullish_probability:
-            reasons.append("bearish probability dominates")
-            return self._build_directional_signal(
-                action=SignalAction.BUY_PE,
-                confidence=probabilities.bearish_probability,
+            spread_pct: float | None = None
+            iv_perc: float | None = None
+
+            if (
+                candidate_strike is not None
+                and candidate_strike.strike is not None
+                and option_chain is not None
+                and not option_chain.empty
+            ):
+                # Step 1: Liquidity Filter (spread percentage <= 0.05)
+                liq_ok, spread_pct, liq_reason = self.check_liquidity_filter(
+                    strike=candidate_strike.strike,
+                    side=target_side,
+                    option_chain=option_chain,
+                )
+                if not liq_ok:
+                    reasons.append(liq_reason or "liquidity filter rejected entry")
+                    sig = self._neutral_signal(state, regime, probabilities, trap, close, reasons)
+                    sig.strike = candidate_strike
+                    sig.spread_percentage = spread_pct
+                    sig.iv_percentile = None
+                    sig.filter_passed = False
+                    sig.filter_rejection_reason = liq_reason or "liquidity filter rejected entry"
+                    return sig
+
+                # Step 2: Volatility Filter (IV < 90th percentile of rolling historical window)
+                vol_ok, cur_iv, iv_perc, vol_reason = self.check_volatility_filter(
+                    strike=candidate_strike.strike,
+                    side=target_side,
+                    option_chain=option_chain,
+                    historical_iv_window=historical_iv_window,
+                )
+                if not vol_ok:
+                    reasons.append(vol_reason or "volatility filter rejected entry")
+                    sig = self._neutral_signal(state, regime, probabilities, trap, close, reasons)
+                    sig.strike = candidate_strike
+                    sig.spread_percentage = spread_pct
+                    sig.iv_percentile = iv_perc
+                    sig.filter_passed = False
+                    sig.filter_rejection_reason = vol_reason or "volatility filter rejected entry"
+                    return sig
+
+            reasons.append("bullish probability dominates" if is_bullish else "bearish probability dominates")
+            sig = self._build_directional_signal(
+                action=target_action,
+                confidence=target_conf,
                 state=state,
                 regime=regime,
                 probabilities=probabilities,
@@ -334,6 +528,13 @@ class SignalGenerationEngine:
                 close=close,
                 reasons=reasons,
             )
+            if candidate_strike is not None:
+                sig.strike = candidate_strike
+            sig.spread_percentage = spread_pct
+            sig.iv_percentile = iv_perc
+            sig.filter_passed = True
+            sig.filter_rejection_reason = None
+            return sig
 
         reasons.append("no directional edge")
         return self._neutral_signal(state, regime, probabilities, trap, close, reasons)
@@ -367,6 +568,7 @@ class SignalGenerationEngine:
             state=state,
             transition=state.transition,
             reasoning=reasons,
+            signal_id=f"SIG-{state.timestamp.strftime('%Y%m%d%H%M%S')}-{next(self._signal_counter):05d}",
         )
 
     def _build_directional_signal(
@@ -406,6 +608,8 @@ class SignalGenerationEngine:
             state=state,
             transition=state.transition,
             reasoning=reasons + list(state.notes),
+            signal_id=f"SIG-{state.timestamp.strftime('%Y%m%d%H%M%S')}-{next(self._signal_counter):05d}",
+            filter_passed=True,
         )
 
 

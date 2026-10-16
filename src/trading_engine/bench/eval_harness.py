@@ -16,16 +16,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 from datetime import datetime
 from pathlib import Path
-import logging
 
 import pandas as pd
 
-from trading_engine.features.feature_pipeline import FeaturePipeline, FeaturePipelineConfig
-from trading_engine.ml.train import RandomForestWalkForwardTrainer, RandomForestTrainingConfig
-from trading_engine.ml.inference import save_artifact, predict_with_confidence
 from trading_engine.config.settings import get_settings
+from trading_engine.features.feature_pipeline import FeaturePipeline, FeaturePipelineConfig
+from trading_engine.ml.inference import predict_with_confidence, save_artifact
+from trading_engine.ml.train import RandomForestTrainingConfig, RandomForestWalkForwardTrainer
 
 logger = logging.getLogger("te.eval")
 
@@ -137,7 +137,7 @@ def run_evaluation(
     # Try to run the backtest if backtrader is available. If not, skip gracefully.
     backtest_output: dict[str, object] | None = None
     try:
-        from trading_engine.backtest.engine import run_directional_backtest, BacktestConfig
+        from trading_engine.backtest.engine import BacktestConfig, run_directional_backtest
 
         bt_config = BacktestConfig()
         bt_result = run_directional_backtest(backtest_df, config=bt_config, datetime_col="timestamp")

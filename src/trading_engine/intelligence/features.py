@@ -2,20 +2,17 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import datetime
 
 import numpy as np
 import pandas as pd
 
 from trading_engine.features.options_analytics import (
     compute_dealer_positioning_proxy,
-    compute_iv_percentile,
     compute_iv_skew,
     compute_max_pain,
     compute_oi_imbalance,
     compute_put_call_ratio,
-    compute_realized_volatility,
-    compute_rolling_correlation,
     compute_strike_concentration_zones,
 )
 from trading_engine.intelligence.models import LiveFeatures, MarketSnapshotBundle, SessionPhase
@@ -120,8 +117,13 @@ def _build_timeframe_summary(frame: pd.DataFrame, label: str, timestamp: datetim
         ],
         axis=1,
     ).max(axis=1)
-    atr = true_range.rolling(window=min(14, len(working)), min_periods=max(3, min(14, len(working)) // 2)).mean()
-    atr_baseline = atr.rolling(window=min(20, len(working)), min_periods=max(3, min(20, len(working)) // 2)).mean()
+    window_atr = max(1, min(14, len(working)))
+    min_periods_atr = max(1, min(3, window_atr // 2)) if window_atr >= 3 else 1
+    atr = true_range.rolling(window=window_atr, min_periods=min_periods_atr).mean()
+
+    window_base = max(1, min(20, len(working)))
+    min_periods_base = max(1, min(3, window_base // 2)) if window_base >= 3 else 1
+    atr_baseline = atr.rolling(window=window_base, min_periods=min_periods_base).mean()
     vwap = (close * volume).cumsum() / volume.replace(0.0, np.nan).cumsum()
     returns = close.pct_change().fillna(0.0)
 
@@ -381,8 +383,10 @@ def _failed_breakout_frequency(frame: pd.DataFrame) -> float:
     closes = frame["close"].astype(float)
     highs = frame["high"].astype(float)
     lows = frame["low"].astype(float)
-    rolling_high = highs.rolling(window=min(10, len(frame)), min_periods=3).max().shift(1)
-    rolling_low = lows.rolling(window=min(10, len(frame)), min_periods=3).min().shift(1)
+    _w = max(1, min(10, len(frame)))
+    _mp = max(1, min(3, _w))
+    rolling_high = highs.rolling(window=_w, min_periods=_mp).max().shift(1)
+    rolling_low = lows.rolling(window=_w, min_periods=_mp).min().shift(1)
     breakout_up = closes > rolling_high
     breakout_down = closes < rolling_low
     failures = 0
@@ -405,7 +409,7 @@ def _directional_persistence(returns: pd.Series) -> float:
         return float("nan")
     signs = np.sign(returns.to_numpy(dtype=float))
     if len(signs) < 2:
-        return float(0.5)
+        return 0.5
     persistence = np.mean(signs[1:] == signs[:-1])
     return float(persistence)
 
@@ -436,7 +440,9 @@ def _narrow_range_compression(frame: pd.DataFrame) -> float:
 def _volume_expansion(volume: pd.Series) -> float:
     if volume.empty:
         return 0.0
-    rolling_mean = volume.rolling(window=min(10, len(volume)), min_periods=max(3, min(10, len(volume)) // 2)).mean()
+    window_vol = max(1, min(10, len(volume)))
+    min_periods_vol = max(1, min(3, window_vol // 2)) if window_vol >= 3 else 1
+    rolling_mean = volume.rolling(window=window_vol, min_periods=min_periods_vol).mean()
     baseline = float(rolling_mean.iloc[-1]) if not rolling_mean.empty else float("nan")
     latest = float(volume.iloc[-1])
     if not np.isfinite(baseline) or baseline <= 0:
@@ -461,8 +467,10 @@ def _atr_compression(atr: pd.Series, baseline: pd.Series) -> float:
 def _breakout_pressure(close: pd.Series, high: pd.Series, low: pd.Series) -> float:
     if close.empty:
         return 0.0
-    rolling_high = high.rolling(window=min(20, len(close)), min_periods=max(3, min(20, len(close)) // 2)).max().shift(1)
-    rolling_low = low.rolling(window=min(20, len(close)), min_periods=max(3, min(20, len(close)) // 2)).min().shift(1)
+    w_size = max(1, min(20, len(close)))
+    m_periods = max(1, min(3, w_size // 2)) if w_size >= 3 else 1
+    rolling_high = high.rolling(window=w_size, min_periods=m_periods).max().shift(1)
+    rolling_low = low.rolling(window=w_size, min_periods=m_periods).min().shift(1)
     latest = float(close.iloc[-1])
     top = float(rolling_high.iloc[-1]) if not pd.isna(rolling_high.iloc[-1]) else latest
     bottom = float(rolling_low.iloc[-1]) if not pd.isna(rolling_low.iloc[-1]) else latest
@@ -522,7 +530,9 @@ def _realized_vol_proxy(option_chain: pd.DataFrame, spot_price: float | None) ->
     strikes = pd.to_numeric(option_chain["strike"], errors="coerce").dropna()
     if strikes.empty:
         return float("nan")
-    return float(strikes.pct_change().abs().rolling(window=min(10, len(strikes)), min_periods=3).mean().iloc[-1])
+    _w_s = max(1, min(10, len(strikes)))
+    _mp_s = max(1, min(3, _w_s))
+    return float(strikes.pct_change().abs().rolling(window=_w_s, min_periods=_mp_s).mean().iloc[-1])
 
 
 def _dealer_positioning(option_chain: pd.DataFrame, timestamp: pd.Timestamp) -> float:

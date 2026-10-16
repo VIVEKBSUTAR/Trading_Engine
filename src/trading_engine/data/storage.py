@@ -7,8 +7,8 @@ from typing import Any
 
 import duckdb
 import pandas as pd
-import pyarrow.dataset as ds
 import pyarrow as pa
+import pyarrow.dataset as ds
 
 from trading_engine.common.exceptions import StorageError
 from trading_engine.common.logging import get_logger
@@ -122,16 +122,16 @@ class ParquetDuckDBStore:
                 ?,
                 ?,
                 filename,
-                regexp_extract(filename, '.*/(feed=.*?/date=.*?)/.*', 1) AS partition_key,
+                regexp_extract(filename, '.*/(' || ? || '/\\d{{4}}-\\d{{2}}-\\d{{2}})/.*', 1) AS partition_key,
                 MIN({timestamp_col}) AS min_timestamp,
                 MAX({timestamp_col}) AS max_timestamp,
                 COUNT(*) AS row_count
             FROM read_parquet(?, filename = true)
-            WHERE feed = ?
+            WHERE filename LIKE '%/' || ? || '/%'
             GROUP BY filename, partition_key
         """
 
-        self._con.execute(query, [dataset, feed, str(dataset_glob), feed])
+        self._con.execute(query, [dataset, feed, feed, str(dataset_glob), feed])
 
     def load_dataset(
         self,

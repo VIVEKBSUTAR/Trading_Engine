@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Callable
 
 import pandas as pd
 from loguru import logger
@@ -19,8 +19,8 @@ from ingestion.nse_fetcher import NSEOptionChainFetcher
 from ingestion.parser import OptionChainParser
 from ingestion.validators import OptionChainValidator
 from trading_engine.intelligence.engine import LiveIntelligenceEngine
-from trading_engine.intelligence.state import MarketStateAggregator
 from trading_engine.intelligence.models import IntelligenceReport, MarketState
+from trading_engine.intelligence.state import MarketStateAggregator
 
 
 @dataclass(slots=True)
@@ -95,10 +95,18 @@ class LiveIntelligenceRuntime:
             if self._callbacks.on_error:
                 self._callbacks.on_error(exc)
 
-        state = self._aggregator.build_market_state(snapshot)
+        snapshot_bundle = self._aggregator.build_snapshot()
+        state = self._aggregator.build_market_state(snapshot_bundle)
         self._latest_state = state
-        report = self._engine.process(snapshot, state=state)
+        report = self._engine.process(snapshot_bundle, state=state)
         self._latest_report = report
+        
+        # Dynamically subscribe to nearby option tokens using the fresh snapshot
+        try:
+            self._update_dynamic_subscriptions(snapshot)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to update dynamic subscriptions", error=str(exc))
+            
         if self._callbacks.on_report:
             self._callbacks.on_report(report)
         return report
@@ -115,6 +123,38 @@ class LiveIntelligenceRuntime:
         """Stop websocket streaming cleanly."""
         self._stream.stop()
 
+    def _update_dynamic_subscriptions(self, snapshot) -> None:
+        if snapshot.nifty_spot.last_price is None or snapshot.option_instruments.empty:
+            return
+            
+        spot = snapshot.nifty_spot.last_price
+        atm_strike = round(spot / 50) * 50
+        target_strikes = [atm_strike + offset for offset in range(-150, 200, 50)]
+        
+        df = snapshot.option_instruments.copy()
+        if "expiry" not in df.columns or "strike" not in df.columns or "instrument_token" not in df.columns:
+            return
+            
+        df["expiry_date"] = pd.to_datetime(df["expiry"], errors="coerce", utc=True)
+        now = pd.Timestamp.now(tz="UTC")
+        future_expiries = df[df["expiry_date"] >= now.normalize()]
+        if future_expiries.empty:
+            return
+            
+        nearest_expiry = future_expiries["expiry_date"].min()
+        relevant = future_expiries[
+            (future_expiries["expiry_date"] == nearest_expiry) &
+            (future_expiries["strike"].isin(target_strikes))
+        ]
+        
+        tokens = set(relevant["instrument_token"].astype(int).tolist())
+        tokens.update(self._settings.kite.stream_tokens)
+        
+        current_subs = self._stream.state.subscribed_tokens
+        if tokens != current_subs:
+            logger.info("Updating dynamic websocket subscriptions", new_count=len(tokens), added=len(tokens - current_subs))
+            self._stream.subscribe(list(tokens))
+
     def _on_connect(self) -> None:
         try:
             self.refresh_once()
@@ -124,11 +164,12 @@ class LiveIntelligenceRuntime:
                 self._callbacks.on_error(exc)
 
     def _on_tick_frame(self, frame: pd.DataFrame) -> None:
+        data_received_at = datetime.now(UTC)
         self._aggregator.update_ticks(NormalizedTickBatch(frame=frame, row_count=len(frame), source="kite"))
         try:
             snapshot = self._aggregator.build_snapshot()
             self._latest_state = self._aggregator.build_market_state(snapshot)
-            self._latest_report = self._engine.process(snapshot, state=self._latest_state)
+            self._latest_report = self._engine.process(snapshot, state=self._latest_state, data_received_at=data_received_at)
             if self._callbacks.on_report:
                 self._callbacks.on_report(self._latest_report)
         except Exception as exc:  # noqa: BLE001

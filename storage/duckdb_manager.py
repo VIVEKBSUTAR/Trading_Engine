@@ -12,11 +12,14 @@ from loguru import logger
 
 
 class DuckDBManager:
-    """Manage metadata tables and analytical queries over parquet datasets."""
+    """Manage metadata tables, signals, trade outcomes, and analytical queries over parquet datasets."""
 
-    def __init__(self, db_path: Path) -> None:
-        self._db_path = db_path
-        self._con = duckdb.connect(str(db_path))
+    def __init__(self, db_path: Path | str | None = None) -> None:
+        if db_path is None:
+            db_path = Path("data/cache/metadata.duckdb")
+        self._db_path = Path(db_path)
+        self._db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._con = duckdb.connect(str(self._db_path))
         self._bootstrap()
 
     def _bootstrap(self) -> None:
@@ -46,6 +49,61 @@ class DuckDBManager:
             """
             CREATE INDEX IF NOT EXISTS idx_snapshot_ts
             ON ingestion_snapshots(snapshot_ts)
+            """
+        )
+
+        # Step 1: Signals relational table
+        self._con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS signals (
+                signal_id VARCHAR PRIMARY KEY,
+                timestamp TIMESTAMPTZ NOT NULL,
+                spot_price DOUBLE,
+                strike DOUBLE,
+                expiry VARCHAR,
+                option_type VARCHAR,
+                action VARCHAR NOT NULL,
+                confidence DOUBLE,
+                trap_score DOUBLE,
+                spread_percentage DOUBLE,
+                iv_percentile DOUBLE,
+                trade_grade VARCHAR,
+                filter_passed BOOLEAN NOT NULL,
+                filter_rejection_reason VARCHAR
+            )
+            """
+        )
+
+        self._con.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_signals_timestamp
+            ON signals(timestamp)
+            """
+        )
+
+        # Step 1: Trade outcomes relational table
+        self._con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS trade_outcomes (
+                trade_id VARCHAR PRIMARY KEY,
+                signal_id VARCHAR,
+                instrument_token BIGINT NOT NULL,
+                entry_timestamp TIMESTAMPTZ NOT NULL,
+                exit_timestamp TIMESTAMPTZ NOT NULL,
+                entry_ask_price DOUBLE NOT NULL,
+                exit_bid_price DOUBLE NOT NULL,
+                quantity BIGINT NOT NULL,
+                holding_time_minutes DOUBLE NOT NULL,
+                exit_reason VARCHAR NOT NULL,
+                realized_pnl DOUBLE NOT NULL
+            )
+            """
+        )
+
+        self._con.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_trade_outcomes_exit_ts
+            ON trade_outcomes(exit_timestamp)
             """
         )
 
@@ -90,6 +148,133 @@ class DuckDBManager:
             ],
         )
         logger.info("Registered ingestion snapshot", raw_path=str(raw_path), rows=rows_ingested)
+
+    def insert_signal(
+        self,
+        *,
+        signal_id: str,
+        timestamp: datetime,
+        spot_price: float | None,
+        strike: float | None,
+        expiry: str | None,
+        option_type: str | None,
+        action: str,
+        confidence: float,
+        trap_score: float,
+        spread_percentage: float | None,
+        iv_percentile: float | None,
+        trade_grade: str,
+        filter_passed: bool,
+        filter_rejection_reason: str | None = None,
+    ) -> None:
+        """Insert one signal record into DuckDB using a prepared statement."""
+        stmt = """
+        INSERT OR REPLACE INTO signals (
+            signal_id,
+            timestamp,
+            spot_price,
+            strike,
+            expiry,
+            option_type,
+            action,
+            confidence,
+            trap_score,
+            spread_percentage,
+            iv_percentile,
+            trade_grade,
+            filter_passed,
+            filter_rejection_reason
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """
+        self._con.execute(
+            stmt,
+            [
+                str(signal_id),
+                timestamp,
+                float(spot_price) if spot_price is not None else None,
+                float(strike) if strike is not None else None,
+                str(expiry) if expiry is not None else None,
+                str(option_type) if option_type is not None else None,
+                str(action),
+                float(confidence) if confidence is not None else 0.0,
+                float(trap_score) if trap_score is not None else 0.0,
+                float(spread_percentage) if spread_percentage is not None else None,
+                float(iv_percentile) if iv_percentile is not None else None,
+                str(trade_grade),
+                bool(filter_passed),
+                str(filter_rejection_reason) if filter_rejection_reason is not None else None,
+            ],
+        )
+        logger.debug(
+            "Inserted signal record into DuckDB",
+            signal_id=signal_id,
+            action=action,
+            filter_passed=filter_passed,
+        )
+
+    def insert_trade_outcome(
+        self,
+        *,
+        trade_id: str,
+        signal_id: str | None,
+        instrument_token: int,
+        entry_timestamp: datetime,
+        exit_timestamp: datetime,
+        entry_ask_price: float,
+        exit_bid_price: float,
+        quantity: int,
+        holding_time_minutes: float,
+        exit_reason: str,
+        realized_pnl: float,
+    ) -> None:
+        """Insert one completed trade outcome record into DuckDB using a prepared statement."""
+        stmt = """
+        INSERT OR REPLACE INTO trade_outcomes (
+            trade_id,
+            signal_id,
+            instrument_token,
+            entry_timestamp,
+            exit_timestamp,
+            entry_ask_price,
+            exit_bid_price,
+            quantity,
+            holding_time_minutes,
+            exit_reason,
+            realized_pnl
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """
+        self._con.execute(
+            stmt,
+            [
+                str(trade_id),
+                str(signal_id) if signal_id is not None else None,
+                int(instrument_token),
+                entry_timestamp,
+                exit_timestamp,
+                float(entry_ask_price),
+                float(exit_bid_price),
+                int(quantity),
+                float(holding_time_minutes),
+                str(exit_reason),
+                float(realized_pnl),
+            ],
+        )
+        logger.debug(
+            "Inserted trade outcome record into DuckDB",
+            trade_id=trade_id,
+            exit_reason=exit_reason,
+            realized_pnl=realized_pnl,
+        )
+
+    def get_signals(self, limit: int | None = None) -> pd.DataFrame:
+        """Retrieve recent signal records."""
+        limit_sql = f"LIMIT {limit}" if limit else ""
+        return self._con.execute(f"SELECT * FROM signals ORDER BY timestamp DESC {limit_sql}").df()
+
+    def get_trade_outcomes(self, limit: int | None = None) -> pd.DataFrame:
+        """Retrieve recent trade outcome records."""
+        limit_sql = f"LIMIT {limit}" if limit else ""
+        return self._con.execute(f"SELECT * FROM trade_outcomes ORDER BY exit_timestamp DESC {limit_sql}").df()
 
     def query(self, sql: str, params: list[Any] | None = None) -> pd.DataFrame:
         """Run ad-hoc analytical SQL query and return DataFrame."""

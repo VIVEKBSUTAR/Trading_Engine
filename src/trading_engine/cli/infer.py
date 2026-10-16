@@ -5,8 +5,6 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-import pandas as pd
-
 from trading_engine.config.settings import get_settings
 from trading_engine.data.storage import ParquetDuckDBStore
 from trading_engine.features.feature_pipeline import FeaturePipeline, FeaturePipelineConfig

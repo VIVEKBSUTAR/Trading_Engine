@@ -70,7 +70,8 @@ class RegimeDetector:
 
         if iv_realized_spread_col and iv_realized_spread_col in frame.columns:
             iv_spread = frame[iv_realized_spread_col].astype(float)
-            skewed_risk_off = iv_spread > iv_spread.rolling(self._config.vol_window, min_periods=5).median()
+            _min_periods = min(5, self._config.vol_window)
+            skewed_risk_off = iv_spread > iv_spread.rolling(self._config.vol_window, min_periods=_min_periods).median()
             regime = np.where(skewed_risk_off & panic_expansion, "risk_off_expansion", regime)
 
         if expiry_day_col and expiry_day_col in frame.columns:
