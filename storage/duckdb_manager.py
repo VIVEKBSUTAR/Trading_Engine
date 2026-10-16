@@ -14,13 +14,34 @@ from loguru import logger
 class DuckDBManager:
     """Manage metadata tables, signals, trade outcomes, and analytical queries over parquet datasets."""
 
-    def __init__(self, db_path: Path | str | None = None) -> None:
+    def __init__(self, db_path: Path | str | None = None, *, read_only: bool = False) -> None:
         if db_path is None:
             db_path = Path("data/cache/metadata.duckdb")
         self._db_path = Path(db_path)
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._con = duckdb.connect(str(self._db_path))
-        self._bootstrap()
+        self._read_only = read_only
+
+        if read_only and not self._db_path.exists():
+            try:
+                init_con = duckdb.connect(str(self._db_path))
+                self._con = init_con
+                self._bootstrap()
+                self._con.close()
+            except Exception as exc:
+                logger.warning("Could not bootstrap initial DuckDB file: {exc}", exc=str(exc))
+
+        try:
+            self._con = duckdb.connect(str(self._db_path), read_only=read_only)
+        except Exception as exc:
+            logger.warning(
+                "Failed to open DuckDB with read_only={read_only}, falling back to default connection: {exc}",
+                read_only=read_only,
+                exc=str(exc),
+            )
+            self._con = duckdb.connect(str(self._db_path))
+
+        if not read_only:
+            self._bootstrap()
 
     def _bootstrap(self) -> None:
         self._con.execute(
@@ -266,19 +287,34 @@ class DuckDBManager:
             realized_pnl=realized_pnl,
         )
 
+    def query(self, sql: str, params: list[Any] | None = None, *, max_retries: int = 3) -> pd.DataFrame:
+        """Run ad-hoc analytical SQL query and return DataFrame with lock retry."""
+        import time
+
+        for attempt in range(max_retries):
+            try:
+                return self._con.execute(sql, params or []).df()
+            except Exception as exc:
+                err_msg = str(exc).lower()
+                if "does not exist" in err_msg or "not found" in err_msg:
+                    logger.warning("DuckDB table does not exist: {exc}", exc=str(exc))
+                    return pd.DataFrame()
+                if attempt < max_retries - 1:
+                    time.sleep(0.05 * (attempt + 1))
+                    continue
+                logger.warning("DuckDB query failed after retries: {exc}", exc=str(exc))
+                return pd.DataFrame()
+        return pd.DataFrame()
+
     def get_signals(self, limit: int | None = None) -> pd.DataFrame:
         """Retrieve recent signal records."""
         limit_sql = f"LIMIT {limit}" if limit else ""
-        return self._con.execute(f"SELECT * FROM signals ORDER BY timestamp DESC {limit_sql}").df()
+        return self.query(f"SELECT * FROM signals ORDER BY timestamp DESC {limit_sql}")
 
     def get_trade_outcomes(self, limit: int | None = None) -> pd.DataFrame:
         """Retrieve recent trade outcome records."""
         limit_sql = f"LIMIT {limit}" if limit else ""
-        return self._con.execute(f"SELECT * FROM trade_outcomes ORDER BY exit_timestamp DESC {limit_sql}").df()
-
-    def query(self, sql: str, params: list[Any] | None = None) -> pd.DataFrame:
-        """Run ad-hoc analytical SQL query and return DataFrame."""
-        return self._con.execute(sql, params or []).df()
+        return self.query(f"SELECT * FROM trade_outcomes ORDER BY exit_timestamp DESC {limit_sql}")
 
     def query_processed_dataset(self, dataset_root: Path, where_clause: str | None = None) -> pd.DataFrame:
         """Read parquet dataset through DuckDB with optional filter clause."""

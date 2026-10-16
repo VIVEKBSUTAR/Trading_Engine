@@ -174,6 +174,7 @@ class LiveTradeMonitor:
             bid, ask, tick_ts = _extract_token_tick(option_ticks, trade.instrument_token)
 
             if bid is None or tick_ts is None:
+                trade.is_frozen = True
                 logger.warning(
                     "Missing option tick data for tracked token; freezing trade evaluation",
                     trade_id=trade_id,
@@ -187,6 +188,7 @@ class LiveTradeMonitor:
                 tick_ts = tick_ts.replace(tzinfo=UTC)
             gap_seconds = (now - tick_ts).total_seconds()
             if gap_seconds > 2.0:
+                trade.is_frozen = True
                 logger.warning(
                     "Stale option tick data detected; freezing trade evaluation",
                     trade_id=trade_id,
@@ -199,6 +201,8 @@ class LiveTradeMonitor:
                 )
                 # Freeze trade evaluation: do not calculate profit or trigger stops on stale data
                 continue
+
+            trade.is_frozen = False
 
             # Update trade marks with fresh option quotes
             trade.current_bid_price = float(bid)

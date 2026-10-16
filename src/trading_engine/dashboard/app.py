@@ -2,16 +2,134 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict
+import time
 from datetime import UTC, datetime
+from typing import Any
 
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
 from config.settings import AppSettings
-from trading_engine.intelligence.models import IntelligenceReport, SignalAction, TradeGrade
+from storage.duckdb_manager import DuckDBManager
+from trading_engine.intelligence.models import (
+    IntelligenceReport,
+    OpenTrade,
+    SignalAction,
+    TradeGrade,
+)
+from trading_engine.intelligence.monitor import NIFTY_LOT_SIZE, LiveTradeMonitor
 from trading_engine.intelligence.runtime import LiveIntelligenceRuntime
+
+
+def compute_performance_metrics(trade_outcomes: pd.DataFrame) -> dict[str, Any]:
+    """Calculate total realized profit, total closed trades, win rate %, and profit factor."""
+    if trade_outcomes.empty or "realized_pnl" not in trade_outcomes.columns:
+        return {
+            "total_realized_profit": 0.0,
+            "total_closed_trades": 0,
+            "win_rate_pct": 0.0,
+            "profit_factor": 0.0,
+        }
+
+    pnl = pd.to_numeric(trade_outcomes["realized_pnl"], errors="coerce").fillna(0.0)
+    total_realized_profit = float(pnl.sum())
+    total_closed_trades = len(pnl)
+
+    winning_trades = pnl[pnl > 0]
+    losing_trades = pnl[pnl < 0]
+
+    win_rate_pct = (len(winning_trades) / total_closed_trades * 100.0) if total_closed_trades > 0 else 0.0
+
+    gross_profit = float(winning_trades.sum())
+    gross_loss = abs(float(losing_trades.sum()))
+
+    if gross_loss > 0:
+        profit_factor = gross_profit / gross_loss
+    elif gross_profit > 0:
+        profit_factor = float("inf")
+    else:
+        profit_factor = 0.0
+
+    return {
+        "total_realized_profit": total_realized_profit,
+        "total_closed_trades": total_closed_trades,
+        "win_rate_pct": win_rate_pct,
+        "profit_factor": profit_factor,
+    }
+
+
+def compute_equity_curve(trade_outcomes: pd.DataFrame) -> pd.DataFrame:
+    """Compute cumulative profit chronologically across closed trades."""
+    if trade_outcomes.empty or "realized_pnl" not in trade_outcomes.columns or "exit_timestamp" not in trade_outcomes.columns:
+        return pd.DataFrame(columns=["exit_timestamp", "cumulative_profit"])
+
+    df = trade_outcomes.copy()
+    df["exit_timestamp"] = pd.to_datetime(df["exit_timestamp"], errors="coerce")
+    df["realized_pnl"] = pd.to_numeric(df["realized_pnl"], errors="coerce").fillna(0.0)
+    df = df.dropna(subset=["exit_timestamp"]).sort_values("exit_timestamp", ascending=True)
+    df["cumulative_profit"] = df["realized_pnl"].cumsum()
+    return df[["exit_timestamp", "cumulative_profit"]]
+
+
+def compute_unrealized_pnl(trade: OpenTrade) -> float:
+    """Calculate unrealized profit: (current_bid - entry_ask) * 65 * quantity."""
+    bid = float(trade.current_bid_price or 0.0)
+    ask = float(trade.entry_ask_price or 0.0)
+    qty = int(trade.quantity or 0)
+    return (bid - ask) * float(NIFTY_LOT_SIZE) * float(qty)
+
+
+def query_recent_signals(duckdb_mgr: DuckDBManager, limit: int = 50) -> pd.DataFrame:
+    """Query DuckDB signals table for recent records."""
+    sql = f"""
+    SELECT
+        timestamp,
+        spot_price,
+        strike,
+        option_type,
+        action,
+        confidence,
+        trap_score,
+        filter_passed,
+        filter_rejection_reason AS rejection_reason
+    FROM signals
+    ORDER BY timestamp DESC
+    LIMIT {limit}
+    """
+    df = duckdb_mgr.query(sql)
+    if df.empty:
+        return pd.DataFrame(
+            columns=[
+                "timestamp",
+                "spot_price",
+                "strike",
+                "option_type",
+                "action",
+                "confidence",
+                "trap_score",
+                "filter_passed",
+                "rejection_reason",
+            ]
+        )
+    return df
+
+
+def get_dashboard_duckdb_manager(settings: AppSettings) -> DuckDBManager:
+    """Initialize or reuse a thread-safe read-only DuckDBManager."""
+    if "duckdb_mgr" in st.session_state and st.session_state["duckdb_mgr"] is not None:
+        return st.session_state["duckdb_mgr"]
+
+    # If runtime is in session state, reuse its duckdb_manager if possible
+    if "runtime" in st.session_state and st.session_state["runtime"] is not None:
+        runtime_eng = getattr(st.session_state["runtime"], "engine", None)
+        if runtime_eng is not None and getattr(runtime_eng, "duckdb_manager", None) is not None:
+            st.session_state["duckdb_mgr"] = runtime_eng.duckdb_manager
+            return runtime_eng.duckdb_manager
+
+    mgr = DuckDBManager(settings.storage.duckdb_path, read_only=True)
+    st.session_state["duckdb_mgr"] = mgr
+    return mgr
 
 
 def main() -> None:
@@ -19,8 +137,25 @@ def main() -> None:
     st.set_page_config(page_title="NIFTY Intelligence Terminal", layout="wide", initial_sidebar_state="collapsed")
     _inject_styles()
     settings = AppSettings.from_env()
+
+    # Step 5: Automatic refresh controls in sidebar
+    refresh_seconds = getattr(settings.intelligence, "dashboard_refresh_seconds", 5)
+    st.sidebar.markdown("### Terminal Controls")
+    auto_refresh = st.sidebar.checkbox("Auto Refresh", value=True)
+    if auto_refresh:
+        st.sidebar.caption(f"Refresh interval: {refresh_seconds}s")
+
     st.markdown("## NIFTY Intelligence Terminal")
     st.caption("Institutional probabilistic market-state terminal for selective intraday options participation")
+
+    # Step 1: Initialize DuckDBManager and render summary performance banner
+    duckdb_mgr = get_dashboard_duckdb_manager(settings)
+    trade_outcomes = duckdb_mgr.get_trade_outcomes()
+    perf_metrics = compute_performance_metrics(trade_outcomes)
+    _render_performance_banner(perf_metrics)
+
+    # Step 2: Render equity curve section below performance banner
+    _render_equity_curve_section(trade_outcomes)
 
     if "runtime" not in st.session_state:
         st.session_state.runtime = None
@@ -28,37 +163,47 @@ def main() -> None:
 
     runtime = _get_runtime(settings)
     if runtime is None:
-        st.error("Kite Connect credentials are missing. Populate .env and reload the app.")
-        return
+        st.info("Kite Connect credentials unconfigured. Displaying DuckDB historical analytics and database logs.")
+    else:
+        st.caption(f"Manual refresh recommended every {refresh_seconds} seconds while live mode is active.")
+        if st.button("Refresh Now") or st.session_state.last_report is None:
+            try:
+                st.session_state.last_report = runtime.refresh_once()
+            except Exception as exc:  # noqa: BLE001
+                st.error(f"Failed to refresh live report: {exc}")
 
-    st.caption(f"Manual refresh recommended every {settings.intelligence.dashboard_refresh_seconds} seconds while live mode is active.")
+    report: IntelligenceReport | None = st.session_state.last_report
 
-    if st.button("Refresh Now") or st.session_state.last_report is None:
-        try:
-            st.session_state.last_report = runtime.refresh_once()
-        except Exception as exc:  # noqa: BLE001
-            st.error(f"Failed to refresh live report: {exc}")
-            return
+    if report is not None:
+        _render_header_strip(report)
+        left, center, right = st.columns([1.65, 1.45, 1.05], gap="large")
 
-    report: IntelligenceReport = st.session_state.last_report
+        with left:
+            _render_market_intelligence_panel(report)
+            _render_session_panel(report)
+            _render_option_chain_panel(report)
 
-    _render_header_strip(report)
-    left, center, right = st.columns([1.65, 1.45, 1.05], gap="large")
+        with center:
+            _render_signal_terminal(report)
+            _render_structure_panel(report)
 
-    with left:
-        _render_market_intelligence_panel(report)
-        _render_session_panel(report)
-        _render_option_chain_panel(report)
+        with right:
+            if runtime is not None:
+                _render_api_health_panel(runtime)
+            _render_active_positions(runtime.monitor if runtime else None, report)
+            _render_alerts(report)
+            _render_analytics_panel(report)
+    else:
+        # Step 3: Rewrite active positions display even when offline
+        _render_active_positions(runtime.monitor if runtime else None, None)
 
-    with center:
-        _render_signal_terminal(report)
-        _render_structure_panel(report)
+    # Step 4: Signal log section displaying recent 50 records from DuckDB
+    _render_signal_log_section(duckdb_mgr)
 
-    with right:
-        _render_api_health_panel(runtime)
-        _render_trade_monitor(report)
-        _render_alerts(report)
-        _render_analytics_panel(report)
+    # Step 5: Automatic refresh rerun timer
+    if auto_refresh and st.runtime.exists():
+        time.sleep(refresh_seconds)
+        st.rerun()
 
 
 def _get_runtime(settings: AppSettings) -> LiveIntelligenceRuntime | None:
@@ -109,6 +254,45 @@ def _inject_styles() -> None:
         """,
         unsafe_allow_html=True,
     )
+
+
+def _render_performance_banner(metrics: dict[str, Any]) -> None:
+    """Step 1: Summary performance banner at the top of the dashboard with 4 metric cards."""
+    st.markdown("### Historical Performance Overview (DuckDB Analytics)")
+    cols = st.columns(4)
+    total_pnl = metrics["total_realized_profit"]
+    delta_str = f"{'+' if total_pnl > 0 else ''}₹{total_pnl:,.2f}" if total_pnl != 0 else None
+    cols[0].metric(
+        label="Total Realized Profit",
+        value=f"₹{total_pnl:,.2f}",
+        delta=delta_str,
+    )
+    cols[1].metric(
+        label="Total Closed Trades",
+        value=f"{metrics['total_closed_trades']:,}",
+    )
+    cols[2].metric(
+        label="Win Rate",
+        value=f"{metrics['win_rate_pct']:.1f}%",
+    )
+    pf = metrics["profit_factor"]
+    pf_display = "∞" if pf == float("inf") else (f"{pf:.2f}" if pf > 0 else "0.00")
+    cols[3].metric(
+        label="Profit Factor",
+        value=pf_display,
+    )
+
+
+def _render_equity_curve_section(trade_outcomes: pd.DataFrame) -> None:
+    """Step 2: Equity curve section below performance banner using Streamlit native line chart."""
+    st.markdown("#### Realized Cumulative Equity Curve")
+    equity_df = compute_equity_curve(trade_outcomes)
+    if equity_df.empty:
+        st.info("No closed trade records found in DuckDB yet. Equity curve will populate as trades complete.")
+        return
+
+    chart_data = equity_df.set_index("exit_timestamp")[["cumulative_profit"]]
+    st.line_chart(chart_data, y="cumulative_profit", use_container_width=True)
 
 
 def _render_header_strip(report: IntelligenceReport) -> None:
@@ -209,8 +393,8 @@ def _render_structure_panel(report: IntelligenceReport) -> None:
     candles = report.snapshot.candles_1m.tail(40)
     if not candles.empty:
         fig = go.Figure()
-        fig.add_trace(go.Scatter(x=candles["timestamp"], y=candles["close"], mode="lines", line=dict(color="#adc6ff", width=2), name="NIFTY"))
-        fig.update_layout(height=220, margin=dict(l=8, r=8, t=20, b=8), xaxis_rangeslider_visible=False, showlegend=False)
+        fig.add_trace(go.Scatter(x=candles["timestamp"], y=candles["close"], mode="lines", line={"color": "#adc6ff", "width": 2}, name="NIFTY"))
+        fig.update_layout(height=220, margin={"l": 8, "r": 8, "t": 20, "b": 8}, xaxis_rangeslider_visible=False, showlegend=False)
         st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
     else:
         st.info("Waiting for structure data.")
@@ -289,22 +473,131 @@ def _render_signal_terminal(report: IntelligenceReport) -> None:
     st.caption(f"Expires: {_expiry_text(report.signal.expires_at)}")
 
 
-def _render_trade_monitor(report: IntelligenceReport) -> None:
-    st.subheader("Open Trade Monitor")
-    open_trades = report.trade_update.open_trades
-    if not open_trades:
-        st.info("No open live trades.")
-    else:
-        trade_frame = pd.DataFrame([asdict(trade) for trade in open_trades])
-        st.dataframe(trade_frame, use_container_width=True, height=220)
+def _render_active_positions(monitor: LiveTradeMonitor | None, report: IntelligenceReport | None) -> None:
+    """Step 3: Rewritten active positions display connecting to LiveTradeMonitor."""
+    st.subheader("Active Positions (Live Trade Monitor)")
+    open_trades: list[OpenTrade] = []
+    if monitor is not None and hasattr(monitor, "open_trades") and monitor.open_trades:
+        open_trades = list(monitor.open_trades.values()) if isinstance(monitor.open_trades, dict) else list(monitor.open_trades)
+    elif report is not None and report.trade_update and report.trade_update.open_trades:
+        open_trades = report.trade_update.open_trades
 
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Open", len(report.trade_update.open_trades))
-    c2.metric("Closed", len(report.trade_update.closed_trades))
-    c3.metric("Expired", len(report.trade_update.expired_trades))
-    st.caption(f"Total closed P&L: {report.trade_update.total_pnl:,.2f}")
-    if report.trade_update.alert_messages:
-        st.caption(f"Lifecycle notes: {report.trade_update.alert_messages[-1]}")
+    if not open_trades:
+        st.info("No active open positions currently tracked by LiveTradeMonitor.")
+        return
+
+    # Alert badge for frozen trades due to stale ticks
+    frozen_trades = [t for t in open_trades if getattr(t, "is_frozen", False) or t.status == "frozen"]
+    for ft in frozen_trades:
+        st.error(
+            f"🚨 **UNRESOLVABLE DATA ALERT:** Position **{ft.trade_id}** "
+            f"({ft.strike:,.0f} {ft.option_type}) is marked as **FROZEN** due to stale ticks (>2.0s gap or missing quotes). "
+            f"Evaluation and trailing stop adjustments are suspended."
+        )
+
+    rows = []
+    total_unrealized_pnl = 0.0
+    for trade in open_trades:
+        unrealized = compute_unrealized_pnl(trade)
+        total_unrealized_pnl += unrealized
+        is_frozen = getattr(trade, "is_frozen", False) or trade.status == "frozen"
+        status_label = "⚠️ FROZEN (UNRESOLVABLE DATA)" if is_frozen else "🟢 LIVE"
+        stop_val = trade.signal.stop_loss if trade.signal else None
+        stop_str = f"₹{stop_val:,.2f}" if stop_val is not None else "N/A"
+
+        rows.append(
+            {
+                "Trade ID": trade.trade_id,
+                "Strike": f"{trade.strike:,.0f}",
+                "Option Type": trade.option_type,
+                "Qty (Lots)": trade.quantity,
+                "Entry Ask": f"₹{trade.entry_ask_price:,.2f}",
+                "Current Bid": f"₹{trade.current_bid_price:,.2f}",
+                "Trailing Stop": stop_str,
+                "Unrealized P&L (₹)": f"{'+' if unrealized > 0 else ''}₹{unrealized:,.2f}",
+                "Data Health": status_label,
+            }
+        )
+
+    positions_df = pd.DataFrame(rows)
+    st.dataframe(positions_df, use_container_width=True)
+
+    c1, c2 = st.columns(2)
+    c1.metric("Open Contracts", len(open_trades))
+    c2.metric(
+        "Total Unrealized P&L",
+        f"₹{total_unrealized_pnl:,.2f}",
+        delta=f"{'+' if total_unrealized_pnl > 0 else ''}₹{total_unrealized_pnl:,.2f}" if total_unrealized_pnl != 0 else None,
+    )
+
+
+def _render_trade_monitor(report: IntelligenceReport) -> None:
+    """Backward compatible wrapper for active positions display."""
+    _render_active_positions(None, report)
+
+
+def _render_signal_log_section(duckdb_mgr: DuckDBManager) -> None:
+    """Step 4: Query DuckDB signals table for the 50 most recent records and display with distinct rejection styling."""
+    st.markdown("### Signal Log (Last 50 Evaluated Setups from DuckDB)")
+    signals_df = query_recent_signals(duckdb_mgr, limit=50)
+
+    if signals_df.empty:
+        st.info("No signal evaluations recorded in DuckDB yet.")
+        return
+
+    total = len(signals_df)
+    passed_mask = signals_df["filter_passed"].astype(bool)
+    passed_count = int(passed_mask.sum())
+    rejected_count = total - passed_count
+
+    c1, c2 = st.columns([2, 1])
+    c1.caption(f"Evaluations: **{total}** total | ✅ **{passed_count}** Passed | ⛔ **{rejected_count}** Filter-Rejected")
+
+    display_df = signals_df.copy()
+    display_df["Status"] = display_df["filter_passed"].apply(lambda p: "✅ PASSED" if bool(p) else "⛔ REJECTED")
+
+    if "spot_price" in display_df.columns:
+        display_df["spot_price"] = display_df["spot_price"].apply(lambda v: f"₹{v:,.2f}" if pd.notna(v) else "-")
+    if "confidence" in display_df.columns:
+        display_df["confidence"] = display_df["confidence"].apply(lambda v: f"{v:.0%}" if pd.notna(v) else "-")
+    if "trap_score" in display_df.columns:
+        display_df["trap_score"] = display_df["trap_score"].apply(lambda v: f"{v:.2f}" if pd.notna(v) else "-")
+    if "rejection_reason" in display_df.columns:
+        display_df["rejection_reason"] = display_df["rejection_reason"].fillna("-")
+
+    col_order = [
+        "timestamp",
+        "Status",
+        "spot_price",
+        "strike",
+        "option_type",
+        "action",
+        "confidence",
+        "trap_score",
+        "filter_passed",
+        "rejection_reason",
+    ]
+    existing_cols = [c for c in col_order if c in display_df.columns]
+    ordered_df = display_df[existing_cols]
+
+    def _style_signal_row(row: pd.Series) -> list[str]:
+        if not bool(row.get("filter_passed", True)):
+            return ["background-color: rgba(239, 68, 68, 0.18); color: #fca5a5"] * len(row)
+        return ["background-color: rgba(34, 197, 94, 0.10); color: #86efac"] * len(row)
+
+    styled_table = ordered_df.style.apply(_style_signal_row, axis=1)
+    st.dataframe(styled_table, use_container_width=True, height=300)
+
+    # Rejection review callout to help the trader inspect stay-out rationale
+    rejected_setups = signals_df[~passed_mask]
+    if not rejected_setups.empty:
+        with st.expander(f"🔍 Trader Review: Why Did the Engine Say To Stay Out? ({rejected_count} Setups)"):
+            for _, r in rejected_setups.head(10).iterrows():
+                st.markdown(
+                    f"• **{r['timestamp']}** | Strike: **{r.get('strike', 'N/A')} {r.get('option_type', '')}** | Action: `{r.get('action', 'NO_TRADE')}` | Trap Score: `{r.get('trap_score', 0.0):.2f}`<br>"
+                    f"&nbsp;&nbsp;&nbsp;&nbsp;⚠️ **Stay-Out Rationale:** `{r.get('rejection_reason') or 'Filter blocked trade'}`",
+                    unsafe_allow_html=True,
+                )
 
 
 def _render_api_health_panel(runtime: LiveIntelligenceRuntime) -> None:

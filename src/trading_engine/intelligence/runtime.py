@@ -72,6 +72,16 @@ class LiveIntelligenceRuntime:
         """Expose API health for UI and supervisory consumers."""
         return self._security.health_snapshot()
 
+    @property
+    def engine(self) -> LiveIntelligenceEngine:
+        """Expose the live intelligence engine."""
+        return self._engine
+
+    @property
+    def monitor(self):
+        """Expose the live trade monitor."""
+        return self._engine.monitor
+
     def refresh_once(self) -> IntelligenceReport:
         """Poll REST sources once and compute a fresh intelligence report."""
         self._security.validate_environment()

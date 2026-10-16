@@ -414,6 +414,7 @@ class OpenTrade:
     entry_ask_price: float = 0.0
     current_bid_price: float = 0.0
     signal_timestamp: datetime = field(default_factory=lambda: datetime.now(UTC))
+    is_frozen: bool = False
 
 
 @dataclass(slots=True)
