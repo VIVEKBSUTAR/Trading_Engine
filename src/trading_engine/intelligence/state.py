@@ -11,7 +11,7 @@ import numpy as np
 import pandas as pd
 from loguru import logger
 
-from broker.kite_client import LiveMarketSnapshot, MarketQuote
+from broker.fyers_client import LiveMarketSnapshot, MarketQuote
 from broker.normalizer import NormalizedTickBatch
 from storage.parquet_writer import ParquetWriter
 from trading_engine.intelligence.features import build_live_features

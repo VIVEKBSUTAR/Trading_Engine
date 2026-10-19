@@ -1,4 +1,4 @@
-"""Live runtime wiring for Kite Connect, NSE option chain, and intelligence engines."""
+"""Live runtime wiring for Fyers API V3, NSE option chain, and intelligence engines."""
 
 from __future__ import annotations
 
@@ -10,9 +10,9 @@ import pandas as pd
 from loguru import logger
 
 from broker.api_security import APISecurityError, APISecurityGuard
-from broker.kite_auth import KiteAuthManager
-from broker.kite_client import KiteMarketClient
-from broker.kite_stream import KiteStream
+from broker.fyers_auth import FyersAuthManager
+from broker.fyers_client import FyersMarketClient
+from broker.fyers_stream import FyersStream
 from broker.normalizer import NormalizedTickBatch
 from config.settings import AppSettings
 from ingestion.nse_fetcher import NSEOptionChainFetcher
@@ -38,13 +38,18 @@ class LiveIntelligenceRuntime:
         self._settings = settings
         self._callbacks = callbacks or RuntimeCallbacks()
         self._security = APISecurityGuard(settings.security)
-        self._auth = KiteAuthManager(settings.kite, security_guard=self._security)
-        self._client = KiteMarketClient(settings.kite, auth_manager=self._auth, security_guard=self._security)
-        self._stream = KiteStream(settings.kite, auth_manager=self._auth, security_guard=self._security)
+        self._auth = FyersAuthManager(settings.fyers, security_guard=self._security)
+        self._client = FyersMarketClient(settings.fyers, auth_manager=self._auth, security_guard=self._security)
+        self._aggregator = MarketStateAggregator()
+        self._stream = FyersStream(
+            settings.fyers,
+            auth_manager=self._auth,
+            security_guard=self._security,
+            aggregator=self._aggregator,
+        )
         self._fetcher = NSEOptionChainFetcher(settings.api)
         self._parser = OptionChainParser()
         self._validator = OptionChainValidator()
-        self._aggregator = MarketStateAggregator()
         self._engine = LiveIntelligenceEngine(settings)
         self._latest_report: IntelligenceReport | None = None
         self._latest_state: MarketState | None = None
@@ -63,7 +68,7 @@ class LiveIntelligenceRuntime:
         return self._latest_state
 
     @property
-    def stream(self) -> KiteStream:
+    def stream(self) -> FyersStream:
         """Expose the underlying websocket stream wrapper."""
         return self._stream
 
@@ -110,23 +115,25 @@ class LiveIntelligenceRuntime:
         self._latest_state = state
         report = self._engine.process(snapshot_bundle, state=state)
         self._latest_report = report
-        
+
         # Dynamically subscribe to nearby option tokens using the fresh snapshot
         try:
             self._update_dynamic_subscriptions(snapshot)
         except Exception as exc:  # noqa: BLE001
             logger.warning("Failed to update dynamic subscriptions", error=str(exc))
-            
+
         if self._callbacks.on_report:
             self._callbacks.on_report(report)
         return report
 
     def start_streaming(self) -> None:
-        """Start websocket streaming when tokens are configured."""
+        """Start websocket streaming when tokens or symbols are configured."""
         if self._security.safe_mode:
             raise APISecurityError("Safe mode is active; streaming is blocked")
-        if self._settings.kite.stream_tokens:
-            self._stream.subscribe(list(self._settings.kite.stream_tokens))
+        if self._settings.fyers.stream_symbols:
+            self._stream.subscribe(list(self._settings.fyers.stream_symbols))
+        elif self._settings.fyers.stream_tokens:
+            self._stream.subscribe(list(self._settings.fyers.stream_tokens))
         self._stream.connect(threaded=True)
 
     def stop(self) -> None:
@@ -136,34 +143,45 @@ class LiveIntelligenceRuntime:
     def _update_dynamic_subscriptions(self, snapshot) -> None:
         if snapshot.nifty_spot.last_price is None or snapshot.option_instruments.empty:
             return
-            
+
         spot = snapshot.nifty_spot.last_price
         atm_strike = round(spot / 50) * 50
         target_strikes = [atm_strike + offset for offset in range(-150, 200, 50)]
-        
+
         df = snapshot.option_instruments.copy()
         if "expiry" not in df.columns or "strike" not in df.columns or "instrument_token" not in df.columns:
             return
-            
+
         df["expiry_date"] = pd.to_datetime(df["expiry"], errors="coerce", utc=True)
         now = pd.Timestamp.now(tz="UTC")
         future_expiries = df[df["expiry_date"] >= now.normalize()]
         if future_expiries.empty:
-            return
-            
+            future_expiries = df
+
         nearest_expiry = future_expiries["expiry_date"].min()
         relevant = future_expiries[
-            (future_expiries["expiry_date"] == nearest_expiry) &
-            (future_expiries["strike"].isin(target_strikes))
+            (future_expiries["expiry_date"] == nearest_expiry)
+            & (future_expiries["strike"].isin(target_strikes))
         ]
-        
+        if relevant.empty:
+            relevant = future_expiries.head(10)
+
+        # Register symbol-token mapping with stream
+        for _, r in relevant.iterrows():
+            sym = r.get("symbol") or r.get("tradingsymbol")
+            tok = r.get("instrument_token")
+            if pd.notna(sym) and pd.notna(tok):
+                self._stream.register_symbol_token(str(sym), int(tok))
+
         tokens = set(relevant["instrument_token"].astype(int).tolist())
-        tokens.update(self._settings.kite.stream_tokens)
-        
+        tokens.update(self._settings.fyers.stream_tokens)
+
+        symbols = [str(s) for s in relevant["symbol"].dropna().tolist()] if "symbol" in relevant.columns else []
+
         current_subs = self._stream.state.subscribed_tokens
         if tokens != current_subs:
             logger.info("Updating dynamic websocket subscriptions", new_count=len(tokens), added=len(tokens - current_subs))
-            self._stream.subscribe(list(tokens))
+            self._stream.subscribe(symbols or list(tokens))
 
     def _on_connect(self) -> None:
         try:
@@ -175,7 +193,7 @@ class LiveIntelligenceRuntime:
 
     def _on_tick_frame(self, frame: pd.DataFrame) -> None:
         data_received_at = datetime.now(UTC)
-        self._aggregator.update_ticks(NormalizedTickBatch(frame=frame, row_count=len(frame), source="kite"))
+        self._aggregator.update_ticks(NormalizedTickBatch(frame=frame, row_count=len(frame), source="fyers"))
         try:
             snapshot = self._aggregator.build_snapshot()
             self._latest_state = self._aggregator.build_market_state(snapshot)

@@ -73,20 +73,39 @@ class LoggingSettings:
 
 
 @dataclass(slots=True)
-class KiteSettings:
-    """Kite Connect authentication and streaming configuration."""
+class FyersSettings:
+    """Fyers API V3 authentication and streaming configuration."""
 
-    api_key: str | None = None
-    api_secret: str | None = None
+    client_id: str | None = None
+    secret_key: str | None = None
+    redirect_uri: str = "https://127.0.0.1"
     access_token: str | None = None
-    request_token: str | None = None
+    auth_code: str | None = None
     token_store_path: Path | None = None
     reconnect: bool = True
     reconnect_max_tries: int = 50
     reconnect_max_delay: int = 60
     connect_timeout: int = 30
     stream_tokens: tuple[int, ...] = ()
+    stream_symbols: tuple[str, ...] = ()
     stream_mode: str = "full"
+    litemode: bool = False
+
+    @property
+    def api_key(self) -> str | None:
+        return self.client_id
+
+    @property
+    def api_secret(self) -> str | None:
+        return self.secret_key
+
+    @property
+    def request_token(self) -> str | None:
+        return self.auth_code
+
+
+# Backward compatibility alias
+KiteSettings = FyersSettings
 
 
 @dataclass(slots=True)
@@ -155,10 +174,15 @@ class AppSettings:
     storage: StorageSettings
     scheduler: SchedulerSettings
     logging: LoggingSettings
-    kite: KiteSettings
+    fyers: FyersSettings
     security: SecuritySettings
     intelligence: IntelligenceSettings
     risk: RiskSettings
+
+    @property
+    def kite(self) -> FyersSettings:
+        """Backward compatibility alias for fyers settings."""
+        return self.fyers
 
     @classmethod
     def from_env(cls, project_root: Path | None = None) -> AppSettings:
@@ -177,19 +201,35 @@ class AppSettings:
         max_retries = int(os.getenv("TE_API_MAX_RETRIES", "4"))
 
         token_store_path = Path(
-            os.getenv("KITE_TOKEN_STORE_PATH", str(metadata_dir / "kite_access_token.txt"))
+            os.getenv(
+                "FYERS_TOKEN_STORE_PATH",
+                os.getenv("KITE_TOKEN_STORE_PATH", str(metadata_dir / "fyers_access_token.txt")),
+            )
         ).resolve()
 
-        stream_tokens_raw = os.getenv("KITE_STREAM_TOKENS", "").strip()
+        stream_tokens_raw = (os.getenv("FYERS_STREAM_TOKENS") or os.getenv("KITE_STREAM_TOKENS") or "").strip()
         stream_tokens = tuple(
             int(token.strip())
             for token in stream_tokens_raw.split(",")
-            if token.strip()
+            if token.strip() and token.strip().isdigit()
+        )
+
+        stream_symbols_raw = os.getenv("FYERS_STREAM_SYMBOLS", "").strip()
+        stream_symbols = tuple(
+            sym.strip()
+            for sym in stream_symbols_raw.split(",")
+            if sym.strip()
         )
 
         environment = os.getenv("TE_ENVIRONMENT", "development").strip().lower()
         allow_live_execution = os.getenv("TE_ALLOW_LIVE_EXECUTION", "false").lower() in {"1", "true", "yes"}
         require_manual_execution_approval = os.getenv("TE_REQUIRE_MANUAL_EXECUTION_APPROVAL", "true").lower() in {"1", "true", "yes"}
+
+        fyers_client_id = os.getenv("FYERS_CLIENT_ID") or os.getenv("KITE_API_KEY") or None
+        fyers_secret_key = os.getenv("FYERS_SECRET_KEY") or os.getenv("KITE_API_SECRET") or None
+        fyers_redirect_uri = os.getenv("FYERS_REDIRECT_URI", "https://127.0.0.1").strip()
+        fyers_access_token = os.getenv("FYERS_ACCESS_TOKEN") or os.getenv("KITE_ACCESS_TOKEN") or None
+        fyers_auth_code = os.getenv("FYERS_AUTH_CODE") or os.getenv("KITE_REQUEST_TOKEN") or None
 
         settings = cls(
             api=APISettings(timeout_seconds=timeout_seconds, max_retries=max_retries),
@@ -209,18 +249,21 @@ class AppSettings:
                 log_dir=log_dir,
                 level=os.getenv("TE_LOG_LEVEL", "INFO"),
             ),
-            kite=KiteSettings(
-                api_key=os.getenv("KITE_API_KEY") or None,
-                api_secret=os.getenv("KITE_API_SECRET") or None,
-                access_token=os.getenv("KITE_ACCESS_TOKEN") or None,
-                request_token=os.getenv("KITE_REQUEST_TOKEN") or None,
+            fyers=FyersSettings(
+                client_id=fyers_client_id,
+                secret_key=fyers_secret_key,
+                redirect_uri=fyers_redirect_uri,
+                access_token=fyers_access_token,
+                auth_code=fyers_auth_code,
                 token_store_path=token_store_path,
-                reconnect=os.getenv("KITE_RECONNECT", "true").lower() in {"1", "true", "yes"},
-                reconnect_max_tries=int(os.getenv("KITE_RECONNECT_MAX_TRIES", "50")),
-                reconnect_max_delay=int(os.getenv("KITE_RECONNECT_MAX_DELAY", "60")),
-                connect_timeout=int(os.getenv("KITE_CONNECT_TIMEOUT", "30")),
+                reconnect=os.getenv("FYERS_RECONNECT", os.getenv("KITE_RECONNECT", "true")).lower() in {"1", "true", "yes"},
+                reconnect_max_tries=int(os.getenv("FYERS_RECONNECT_MAX_TRIES", os.getenv("KITE_RECONNECT_MAX_TRIES", "50"))),
+                reconnect_max_delay=int(os.getenv("FYERS_RECONNECT_MAX_DELAY", os.getenv("KITE_RECONNECT_MAX_DELAY", "60"))),
+                connect_timeout=int(os.getenv("FYERS_CONNECT_TIMEOUT", os.getenv("KITE_CONNECT_TIMEOUT", "30"))),
                 stream_tokens=stream_tokens,
-                stream_mode=os.getenv("KITE_STREAM_MODE", "full").lower(),
+                stream_symbols=stream_symbols,
+                stream_mode=os.getenv("FYERS_STREAM_MODE", os.getenv("KITE_STREAM_MODE", "full")).lower(),
+                litemode=os.getenv("FYERS_LITEMODE", "false").lower() in {"1", "true", "yes"},
             ),
             security=SecuritySettings(
                 environment=environment,
@@ -280,5 +323,5 @@ class AppSettings:
         self.storage.metadata_dir.mkdir(parents=True, exist_ok=True)
         self.storage.duckdb_path.parent.mkdir(parents=True, exist_ok=True)
         self.logging.log_dir.mkdir(parents=True, exist_ok=True)
-        if self.kite.token_store_path is not None:
-            self.kite.token_store_path.parent.mkdir(parents=True, exist_ok=True)
+        if self.fyers.token_store_path is not None:
+            self.fyers.token_store_path.parent.mkdir(parents=True, exist_ok=True)

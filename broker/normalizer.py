@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any, Mapping, Sequence
+from typing import Any
 
 import pandas as pd
 from loguru import logger
@@ -136,6 +137,7 @@ def _safe_float(value: Any) -> float | None:
         return None
 
 
+
 def _safe_bool(value: Any) -> bool | None:
     if value is None:
         return None
@@ -148,3 +150,133 @@ def _safe_bool(value: Any) -> bool | None:
         if lowered in {"false", "0", "no"}:
             return False
     return bool(value)
+
+
+class FyersTickNormalizer:
+    """Convert raw Fyers DataSocket ticks into a standardized tabular schema."""
+
+    BASE_COLUMNS: tuple[str, ...] = (
+        "timestamp",
+        "instrument_token",
+        "tradingsymbol",
+        "last_price",
+        "bid_price",
+        "ask_price",
+        "volume_traded",
+        "total_buy_quantity",
+        "total_sell_quantity",
+        "average_traded_price",
+        "change",
+        "oi",
+        "ohlc_open",
+        "ohlc_high",
+        "ohlc_low",
+        "ohlc_close",
+    )
+
+    def __init__(self, symbol_token_map: dict[str, int] | None = None) -> None:
+        import re
+        self._re = re
+        self._symbol_to_token: dict[str, int] = dict(symbol_token_map or {})
+        self._token_to_symbol: dict[int, str] = {v: k for k, v in self._symbol_to_token.items()}
+
+    def register_symbol_token(self, symbol: str, token: int) -> None:
+        """Register or update symbol-to-token mapping."""
+        self._symbol_to_token[symbol] = int(token)
+        self._token_to_symbol[int(token)] = symbol
+
+    def normalize_tick(self, tick: Mapping[str, Any]) -> dict[str, Any]:
+        """Flatten one raw Fyers websocket tick dictionary."""
+        sym = str(tick.get("symbol") or "")
+        token = self._resolve_token(tick, sym)
+
+        ts = (
+            self._normalize_timestamp(tick.get("exch_feed_time"))
+            or self._normalize_timestamp(tick.get("last_traded_time"))
+            or datetime.now(UTC)
+        )
+
+        lp = _safe_float(tick.get("ltp") or tick.get("last_price") or tick.get("lp"))
+        bid = _safe_float(tick.get("bid_price") or tick.get("bid") or tick.get("bp"))
+        ask = _safe_float(tick.get("ask_price") or tick.get("ask") or tick.get("ap"))
+
+        if bid is None and lp is not None and lp > 0:
+            bid = round(lp * 0.998, 2)
+        if ask is None and lp is not None and lp > 0:
+            ask = round(lp * 1.002, 2)
+
+        return {
+            "timestamp": ts,
+            "instrument_token": token,
+            "tradingsymbol": sym,
+            "last_price": lp,
+            "bid_price": bid,
+            "ask_price": ask,
+            "volume_traded": _safe_float(tick.get("vol_traded_today") or tick.get("volume")),
+            "total_buy_quantity": _safe_float(tick.get("tot_buy_qty") or tick.get("bid_size")),
+            "total_sell_quantity": _safe_float(tick.get("tot_sell_qty") or tick.get("ask_size")),
+            "average_traded_price": _safe_float(tick.get("avg_trade_price") or tick.get("atp")),
+            "change": _safe_float(tick.get("ch") or tick.get("change")),
+            "oi": _safe_float(tick.get("OI") or tick.get("oi")),
+            "ohlc_open": _safe_float(tick.get("open_price")),
+            "ohlc_high": _safe_float(tick.get("high_price")),
+            "ohlc_low": _safe_float(tick.get("low_price")),
+            "ohlc_close": _safe_float(tick.get("prev_close_price")),
+        }
+
+    def normalize_ticks(
+        self,
+        ticks: Sequence[Mapping[str, Any]] | Mapping[str, Any],
+        source: str = "fyers",
+    ) -> NormalizedTickBatch:
+        """Normalize a tick or sequence of ticks into NormalizedTickBatch."""
+        raw_list = [ticks] if isinstance(ticks, Mapping) else list(ticks)
+
+        records = [self.normalize_tick(t) for t in raw_list if isinstance(t, Mapping)]
+        frame = pd.DataFrame.from_records(records)
+        if frame.empty:
+            return NormalizedTickBatch(frame=frame, row_count=0, source=source)
+
+        frame["timestamp"] = pd.to_datetime(frame["timestamp"], errors="coerce", utc=True)
+        numeric_cols = [
+            "instrument_token", "last_price", "bid_price", "ask_price",
+            "volume_traded", "total_buy_quantity", "total_sell_quantity",
+            "average_traded_price", "change", "oi",
+            "ohlc_open", "ohlc_high", "ohlc_low", "ohlc_close",
+        ]
+        for col in numeric_cols:
+            if col in frame.columns:
+                frame[col] = pd.to_numeric(frame[col], errors="coerce")
+
+        return NormalizedTickBatch(frame=frame, row_count=len(frame), source=source)
+
+    def _resolve_token(self, tick: Mapping[str, Any], symbol: str) -> int | None:
+        if symbol in self._symbol_to_token:
+            return self._symbol_to_token[symbol]
+
+        tok = tick.get("instrument_token") or tick.get("token") or tick.get("fyToken") or tick.get("exchange_token")
+        if tok is not None:
+            clean = self._re.sub(r"\D", "", str(tok))
+            if clean:
+                return int(clean[-10:])
+
+        if symbol:
+            match = self._re.search(r"(\d{5})(CE|PE)", symbol.upper())
+            if match:
+                strike_val = int(match.group(1))
+                side_mult = 1 if match.group(2) == "CE" else 2
+                return strike_val * 10 + side_mult
+
+        return None
+
+    @staticmethod
+    def _normalize_timestamp(value: Any) -> pd.Timestamp | None:
+        if value is None:
+            return None
+        if isinstance(value, (int, float)):
+            ts = value / 1000.0 if value > 1e11 else float(value)
+            return pd.to_datetime(ts, unit="s", utc=True)
+        ts = pd.to_datetime(value, errors="coerce", utc=True)
+        if pd.isna(ts):
+            return None
+        return ts

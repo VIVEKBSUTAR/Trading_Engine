@@ -1,4 +1,4 @@
-"""Entrypoint for authenticated Kite Connect live connectivity."""
+"""Entrypoint for authenticated Fyers API V3 live connectivity."""
 
 from __future__ import annotations
 
@@ -9,9 +9,9 @@ from threading import Event
 from loguru import logger
 
 from broker.api_security import APISecurityError, APISecurityGuard
-from broker.kite_auth import KiteAuthError, KiteAuthManager
-from broker.kite_client import KiteMarketClient
-from broker.kite_stream import KiteStream
+from broker.fyers_auth import FyersAuthError, FyersAuthManager
+from broker.fyers_client import FyersMarketClient
+from broker.fyers_stream import FyersStream
 from config.settings import AppSettings
 
 
@@ -40,10 +40,10 @@ def configure_logging(settings: AppSettings) -> None:
 
 
 def main() -> int:
-    """Start authenticated Kite connectivity and websocket streaming."""
+    """Start authenticated Fyers connectivity and websocket streaming."""
     settings = AppSettings.from_env()
     configure_logging(settings)
-    logger.info("Initializing Kite Connect runtime", project_root=str(settings.storage.project_root))
+    logger.info("Initializing Fyers API V3 runtime", project_root=str(settings.storage.project_root))
 
     security = APISecurityGuard(settings.security)
     try:
@@ -62,27 +62,26 @@ def main() -> int:
         return 1
 
     try:
-        auth = KiteAuthManager(settings.kite, security_guard=security)
-    except KiteAuthError as exc:
-        logger.exception("Kite auth manager initialization failed", error=str(exc))
+        auth = FyersAuthManager(settings.fyers, security_guard=security)
+    except FyersAuthError as exc:
+        logger.exception("Fyers auth manager initialization failed", error=str(exc))
         return 2
 
     access_token = auth.resolve_access_token()
-    if not access_token and settings.kite.request_token:
+    if not access_token and settings.fyers.auth_code:
         try:
-            session = auth.exchange_request_token(settings.kite.request_token)
-            access_token = session.access_token
-        except KiteAuthError as exc:
-            logger.exception("Request-token exchange failed", error=str(exc))
+            access_token = auth.exchange_auth_code(settings.fyers.auth_code)
+        except FyersAuthError as exc:
+            logger.exception("Authorization code exchange failed", error=str(exc))
             return 2
 
     if not access_token:
         login_url = auth.login_url()
-        logger.warning("No Kite access token available. Complete the login flow first.", login_url=login_url)
+        logger.warning("No Fyers access token available. Complete the login flow first.", login_url=login_url)
         print(login_url)
         return 1
 
-    client = KiteMarketClient(settings.kite, auth_manager=auth, security_guard=security)
+    client = FyersMarketClient(settings.fyers, auth_manager=auth, security_guard=security)
     try:
         profile = client.validate_session()
         snapshot = client.get_live_snapshot()
@@ -92,23 +91,27 @@ def main() -> int:
 
     logger.info(
         "Live market snapshot acquired",
-        user_id=profile.get("user_id"),
+        user_id=profile.get("user_id") or profile.get("fy_id"),
         nifty_last_price=snapshot.nifty_spot.last_price,
         vix_last_price=snapshot.india_vix.last_price,
         option_rows=len(snapshot.option_instruments),
     )
 
-    stream = KiteStream(settings.kite, auth_manager=auth, security_guard=security)
+    stream = FyersStream(settings.fyers, auth_manager=auth, security_guard=security)
+
     def _log_normalized_ticks(frame):
         logger.info("Normalized live tick batch received", rows=len(frame))
 
     stream.register_tick_handler(_log_normalized_ticks)
 
-    if settings.kite.stream_tokens:
-        stream.subscribe(list(settings.kite.stream_tokens))
-        logger.info("Pre-subscribed configured tokens", tokens=list(settings.kite.stream_tokens))
+    if settings.fyers.stream_symbols:
+        stream.subscribe(list(settings.fyers.stream_symbols))
+        logger.info("Pre-subscribed configured symbols", symbols=list(settings.fyers.stream_symbols))
+    elif settings.fyers.stream_tokens:
+        stream.subscribe(list(settings.fyers.stream_tokens))
+        logger.info("Pre-subscribed configured tokens", tokens=list(settings.fyers.stream_tokens))
     else:
-        logger.warning("No stream tokens configured. Websocket will connect without subscriptions.")
+        logger.warning("No stream symbols/tokens configured. Websocket will connect without subscriptions.")
 
     shutdown_event = Event()
 
@@ -124,10 +127,10 @@ def main() -> int:
         if security.safe_mode:
             raise APISecurityError("Safe mode is active; refusing to start websocket execution")
         stream.connect(threaded=True)
-        logger.info("Kite websocket started")
+        logger.info("Fyers websocket started")
         shutdown_event.wait()
     except Exception as exc:  # noqa: BLE001
-        logger.exception("Fatal error in Kite runtime", error=str(exc))
+        logger.exception("Fatal error in Fyers runtime", error=str(exc))
         return 2
     finally:
         stream.stop()
