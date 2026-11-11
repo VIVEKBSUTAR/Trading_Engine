@@ -381,6 +381,9 @@ class SignalResult:
     iv_percentile: float | None = None
     filter_passed: bool | None = None
     filter_rejection_reason: str | None = None
+    days_to_expiry: int | None = None
+    max_holding_minutes: int | None = None
+    strike_oi_ratio: float | None = None
 
     def signal_age_seconds(self) -> float:
         """Seconds elapsed since signal was generated (uses expires_at as anchor)."""
@@ -415,6 +418,10 @@ class OpenTrade:
     current_bid_price: float = 0.0
     signal_timestamp: datetime = field(default_factory=lambda: datetime.now(UTC))
     is_frozen: bool = False
+    option_atr: float | None = None
+    initial_risk: float | None = None
+    stop_loss_price: float | None = None
+    trailing_active: bool = False
 
 
 @dataclass(slots=True)

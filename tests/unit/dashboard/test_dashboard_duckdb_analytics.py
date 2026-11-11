@@ -11,7 +11,7 @@ import pytest
 
 from config.settings import AppSettings
 from storage.duckdb_manager import DuckDBManager
-from trading_engine.dashboard.app import (
+from trading_engine.dashboard.shared import (
     compute_equity_curve,
     compute_performance_metrics,
     compute_unrealized_pnl,
@@ -135,7 +135,7 @@ def test_step3_compute_unrealized_pnl_with_65_multiplier():
     assert pnl == 2600.0
 
 
-def test_step3_frozen_trade_detection():
+def test_step3_frozen_trade_detection(option_history):
     """Step 3: Stale ticks mark trade as is_frozen."""
     dummy_signal = _make_dummy_signal(stop_loss=100.0)
     monitor = LiveTradeMonitor(config=MonitorConfig())
@@ -147,6 +147,7 @@ def test_step3_frozen_trade_detection():
         strike=24500.0,
         option_type="CE",
         entry_ask_price=120.0,
+        option_ticks=option_history(datetime.now(UTC)),
     )
     assert bool(getattr(trade, "is_frozen", False)) is False
 
@@ -232,7 +233,7 @@ def test_step5_get_dashboard_duckdb_manager_caches_in_session_state(tmp_path: Pa
     settings = AppSettings.from_env()
     settings.storage.duckdb_path = db_file
 
-    with patch.dict("trading_engine.dashboard.app.st.session_state", {}, clear=True):
+    with patch.dict("trading_engine.dashboard.shared.st.session_state", {}, clear=True):
         mgr1 = get_dashboard_duckdb_manager(settings)
         mgr2 = get_dashboard_duckdb_manager(settings)
         assert mgr1 is mgr2
@@ -241,7 +242,7 @@ def test_step5_get_dashboard_duckdb_manager_caches_in_session_state(tmp_path: Pa
 
 def test_render_performance_banner_and_equity_curve():
     """Verify performance banner and equity curve render without exception."""
-    from trading_engine.dashboard.app import (
+    from trading_engine.dashboard.shared import (
         _render_equity_curve_section,
         _render_performance_banner,
     )
@@ -253,7 +254,7 @@ def test_render_performance_banner_and_equity_curve():
         "profit_factor": 3.5,
     }
     col_mocks = [MagicMock(), MagicMock(), MagicMock(), MagicMock()]
-    with patch("streamlit.columns", return_value=col_mocks), patch("streamlit.markdown"), patch("streamlit.line_chart") as mock_chart:
+    with patch("streamlit.columns", return_value=col_mocks), patch("streamlit.markdown"), patch("streamlit.plotly_chart") as mock_chart:
         _render_performance_banner(metrics)
         assert col_mocks[0].metric.called
         assert col_mocks[1].metric.called
@@ -269,7 +270,7 @@ def test_render_performance_banner_and_equity_curve():
 
 def test_render_active_positions_surfaces_frozen_alert():
     """Step 3: Frozen positions display alert badge and error message."""
-    from trading_engine.dashboard.app import _render_active_positions
+    from trading_engine.dashboard.shared import _render_active_positions
 
     dummy_signal = _make_dummy_signal()
     trade = OpenTrade(
@@ -296,7 +297,7 @@ def test_render_active_positions_surfaces_frozen_alert():
 
 def test_render_signal_log_section_displays_table_and_rejection_expander(tmp_path: Path):
     """Step 4: Signal log renders table with rejection styling and review expander."""
-    from trading_engine.dashboard.app import _render_signal_log_section
+    from trading_engine.dashboard.shared import _render_signal_log_section
 
     db_file = tmp_path / "test_sig_render.duckdb"
     duckdb_mgr = DuckDBManager(db_file)

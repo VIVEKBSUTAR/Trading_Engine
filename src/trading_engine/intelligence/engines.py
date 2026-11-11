@@ -5,7 +5,7 @@ from __future__ import annotations
 import itertools
 from collections.abc import Iterable
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta
 from math import exp
 
 import numpy as np
@@ -283,31 +283,42 @@ class SignalGenerationEngine:
         strike: float,
         side: OptionSide | str,
         option_chain: pd.DataFrame,
-    ) -> tuple[float | None, float | None, float | None]:
-        """Extract best bid, best ask, and implied volatility for a strike and side."""
+    ) -> tuple[float | None, float | None, float | None, float | None, float | None]:
+        """Return bid, ask, IV, call OI, put OI from one strike/expiry."""
         if option_chain is None or option_chain.empty:
-            return None, None, None
+            return None, None, None, None, None
 
         side_str = side.value.upper() if isinstance(side, OptionSide) else str(side).upper()
         working = option_chain.copy()
 
-        if "option_type" in working.columns:
-            working = working.loc[working["option_type"].astype(str).str.upper() == side_str]
         if "strike" in working.columns:
             working = working.loc[pd.to_numeric(working["strike"], errors="coerce") == float(strike)]
 
         if working.empty:
-            return None, None, None
+            return None, None, None, None, None
 
         if "expiry" in working.columns:
             working = working.sort_values("expiry")
+            working = working.loc[working["expiry"] == working.iloc[0]["expiry"]]
+
+        def oi(option_side: str) -> float | None:
+            rows = working.loc[working["option_type"].astype(str).str.upper() == option_side]
+            if rows.empty:
+                return None
+            row = rows.iloc[0]
+            return _safe_float(row.get("open_interest", row.get("oi")))
+
+        call_oi, put_oi = oi("CE"), oi("PE")
+        working = working.loc[working["option_type"].astype(str).str.upper() == side_str]
+        if working.empty:
+            return None, None, None, call_oi, put_oi
 
         row = working.iloc[0]
         bid = _safe_float(row.get("bid_price") or row.get("bid") or row.get("best_bid"))
         ask = _safe_float(row.get("ask_price") or row.get("ask") or row.get("best_ask") or row.get("last_price"))
         iv = _safe_float(row.get("iv") or row.get("implied_volatility") or row.get("implied_vol"))
 
-        return bid, ask, iv
+        return bid, ask, iv, call_oi, put_oi
 
     def calculate_spread_percentage(self, bid: float, ask: float) -> float | None:
         """Calculate spread percentage: (ask - bid) / bid."""
@@ -322,7 +333,7 @@ class SignalGenerationEngine:
         option_chain: pd.DataFrame,
     ) -> tuple[bool, float | None, str | None]:
         """Verify the selected strike spread percentage does not exceed max_spread_percentage (default 0.05)."""
-        bid, ask, _ = self.extract_strike_quote(strike, side, option_chain)
+        bid, ask, _, _, _ = self.extract_strike_quote(strike, side, option_chain)
         if bid is None or ask is None:
             return True, None, None
 
@@ -348,7 +359,7 @@ class SignalGenerationEngine:
         historical_iv_window: pd.Series | list[float] | None = None,
     ) -> tuple[bool, float | None, float | None, str | None]:
         """Verify implied volatility is below max_implied_volatility_percentile (default 90th percentile)."""
-        _, _, current_iv = self.extract_strike_quote(strike, side, option_chain)
+        _, _, current_iv, _, _ = self.extract_strike_quote(strike, side, option_chain)
         if current_iv is None:
             return True, None, None, None
 
@@ -434,6 +445,7 @@ class SignalGenerationEngine:
         selected_strike: StrikeResult | float | None = None,
         option_chain: pd.DataFrame | None = None,
         historical_iv_window: pd.Series | list[float] | None = None,
+        snapshot_timestamp: datetime | None = None,
     ) -> SignalResult:
         feature_map = state.feature_snapshot
         close = _safe_float(feature_map.get("close")) or _safe_float(feature_map.get("1m_close"))
@@ -478,6 +490,44 @@ class SignalGenerationEngine:
             spread_pct: float | None = None
             iv_perc: float | None = None
 
+            def reject(reason: str) -> SignalResult:
+                sig = self._neutral_signal(state, regime, probabilities, trap, close, [reason])
+                sig.strike = candidate_strike
+                sig.filter_passed = False
+                sig.filter_rejection_reason = reason
+                return sig
+
+            if candidate_strike is None or candidate_strike.strike is None or not candidate_strike.expiry:
+                return reject("DTE filter: missing contract expiry")
+            expiry_date = _contract_expiry(candidate_strike.expiry)
+            if pd.isna(expiry_date):
+                return reject("DTE filter: invalid contract expiry")
+            snapshot_date = pd.Timestamp(snapshot_timestamp or state.timestamp)
+            if snapshot_date.tzinfo is None:
+                snapshot_date = snapshot_date.tz_localize("UTC")
+            snapshot_date = snapshot_date.tz_convert("Asia/Kolkata").date()
+            dte = (expiry_date.date() - snapshot_date).days
+            if dte < 0:
+                return reject("DTE filter: contract already expired")
+            # All quote/IV/OI checks must refer to the exact emitted contract expiry.
+            chain = option_chain if option_chain is not None else pd.DataFrame()
+            if "expiry" in chain:
+                dates = chain["expiry"].map(lambda value: _contract_expiry(value).date() if not pd.isna(_contract_expiry(value)) else None)
+                chain = chain.loc[dates == expiry_date.date()]
+            if chain.empty or "option_type" not in chain or "strike" not in chain:
+                return reject("OI filter: missing contract chain")
+            _, _, _, call_oi, put_oi = self.extract_strike_quote(candidate_strike.strike, target_side, chain)
+            if (call_oi is None or put_oi is None or not np.isfinite(call_oi)
+                    or not np.isfinite(put_oi) or call_oi <= 0 or put_oi < 0):
+                return reject("OI filter: missing or invalid CE/PE open interest")
+            oi_ratio = put_oi / call_oi
+            if (is_bullish and oi_ratio < 0.8) or (is_bearish and oi_ratio > 1.2):
+                rejected = reject(f"OI imbalance filter: put/call ratio {oi_ratio:.4f} rejects {target_action.value}")
+                rejected.strike_oi_ratio = oi_ratio
+                rejected.days_to_expiry = dte
+                rejected.max_holding_minutes = 15 if dte == 0 else 45
+                return rejected
+
             if (
                 candidate_strike is not None
                 and candidate_strike.strike is not None
@@ -488,7 +538,7 @@ class SignalGenerationEngine:
                 liq_ok, spread_pct, liq_reason = self.check_liquidity_filter(
                     strike=candidate_strike.strike,
                     side=target_side,
-                    option_chain=option_chain,
+                    option_chain=chain,
                 )
                 if not liq_ok:
                     reasons.append(liq_reason or "liquidity filter rejected entry")
@@ -504,7 +554,7 @@ class SignalGenerationEngine:
                 vol_ok, cur_iv, iv_perc, vol_reason = self.check_volatility_filter(
                     strike=candidate_strike.strike,
                     side=target_side,
-                    option_chain=option_chain,
+                    option_chain=chain,
                     historical_iv_window=historical_iv_window,
                 )
                 if not vol_ok:
@@ -534,6 +584,9 @@ class SignalGenerationEngine:
             sig.iv_percentile = iv_perc
             sig.filter_passed = True
             sig.filter_rejection_reason = None
+            sig.days_to_expiry = dte
+            sig.max_holding_minutes = 15 if dte == 0 else 45
+            sig.strike_oi_ratio = oi_ratio
             return sig
 
         reasons.append("no directional edge")
@@ -654,7 +707,7 @@ class StrikeSelectionEngine:
             target_strike = spot_price
             moneyness = "conservative_atm"
         chosen = min(strikes, key=lambda strike: abs(strike - target_strike))
-        expiry = self._nearest_expiry(option_chain)
+        expiry = self._nearest_expiry(option_chain, state.timestamp)
         strike_distance = float((chosen - spot_price) / max(spot_price, 1e-9))
         rationale = [f"selected {moneyness}", f"confidence={confidence:.2f}", f"step={step:.2f}", f"grade={state.trade_grade.value}"]
         return StrikeResult(option_side=side, strike=float(chosen), expiry=expiry, moneyness=moneyness, strike_distance=strike_distance, expected_move=expected_move, selection_grade=state.trade_grade, rationale=rationale)
@@ -678,11 +731,16 @@ class StrikeSelectionEngine:
         return step if step > 0 else 50.0
 
     @staticmethod
-    def _nearest_expiry(option_chain: pd.DataFrame) -> str | None:
+    def _nearest_expiry(option_chain: pd.DataFrame, timestamp: datetime | None = None) -> str | None:
         if option_chain.empty or "expiry" not in option_chain.columns:
             return None
-        expiries = option_chain["expiry"].dropna().astype(str).unique().tolist()
-        return sorted(expiries)[0] if expiries else None
+        now = pd.Timestamp(timestamp or datetime.now().astimezone())
+        if now.tzinfo is None:
+            now = now.tz_localize("UTC")
+        day = now.tz_convert("Asia/Kolkata").date()
+        expiries = [_contract_expiry(value) for value in option_chain["expiry"].dropna().unique()]
+        valid = [value for value in expiries if not pd.isna(value) and value.date() >= day]
+        return min(valid).date().isoformat() if valid else None
 
 
 class RiskManagementEngine:
@@ -745,6 +803,16 @@ def _latest_row(features: pd.DataFrame) -> pd.Series:
     if features.empty:
         return pd.Series(dtype=float)
     return features.iloc[-1]
+
+
+def _contract_expiry(value: object) -> pd.Timestamp:
+    """Parse ISO dates, Fyers DD-MM-YYYY dates, and epoch expiry identifiers."""
+    text = str(value)
+    if text.isdigit() and len(text) in {10, 13}:
+        return pd.to_datetime(int(text), unit="ms" if len(text) == 13 else "s", utc=True).tz_convert("Asia/Kolkata").tz_localize(None)
+    if len(text) == 10 and text[2] == "-" and text[5] == "-":
+        return pd.to_datetime(text, format="%d-%m-%Y", errors="coerce")
+    return pd.to_datetime(value, errors="coerce")
 
 
 def _safe_float(value: object) -> float | None:

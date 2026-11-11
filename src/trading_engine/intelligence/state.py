@@ -278,6 +278,14 @@ class MarketStateAggregator:
             return self._option_token_ticks.get(int(instrument_token), pd.DataFrame()).copy()
         return {k: v.copy() for k, v in self._option_token_ticks.items()}
 
+    def get_option_atr_ticks(self, instrument_token: int) -> pd.DataFrame:
+        """Read retained raw stream history too, so an archive flush need not reset ATR."""
+        frame = self.get_option_token_ticks(instrument_token)
+        if not self._ticks.empty and "instrument_token" in self._ticks:
+            stream = self._ticks.loc[self._ticks["instrument_token"] == instrument_token]
+            frame = pd.concat([stream, frame], ignore_index=True)
+        return frame
+
     def get_latest_option_tick(self, instrument_token: int) -> dict[str, Any] | None:
         """Return the most recent bid/ask tick for an instrument token, if available."""
         token = int(instrument_token)

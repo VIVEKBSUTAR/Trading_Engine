@@ -2,6 +2,16 @@
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path as _Path
+
+# Ensure project root and src/ are on sys.path when this module is loaded
+# directly rather than via the installed package entry-point.
+_PROJECT_ROOT = _Path(__file__).resolve().parents[1]
+for _p in [str(_PROJECT_ROOT), str(_PROJECT_ROOT / "src")]:
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -236,7 +246,7 @@ class FyersStream:
         """Gracefully close the websocket connection."""
         self._stop_event.set()
         try:
-            self._socket.close()
+            self._socket.close_connection()
         except Exception as exc:  # noqa: BLE001
             logger.debug("Fyers socket close failed or already closed", error=str(exc))
         self._state.connected = False

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+import shutil
+import tempfile
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -20,8 +22,10 @@ class DuckDBManager:
         self._db_path = Path(db_path)
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
         self._read_only = read_only
+        self._tmp_copy: Path | None = None  # tracks temp copy used for dashboard reads
 
         if read_only and not self._db_path.exists():
+            # Bootstrap a fresh file so the read-only open below always has a target.
             try:
                 init_con = duckdb.connect(str(self._db_path))
                 self._con = init_con
@@ -30,18 +34,85 @@ class DuckDBManager:
             except Exception as exc:
                 logger.warning("Could not bootstrap initial DuckDB file: {exc}", exc=str(exc))
 
-        try:
-            self._con = duckdb.connect(str(self._db_path), read_only=read_only)
-        except Exception as exc:
-            logger.warning(
-                "Failed to open DuckDB with read_only={read_only}, falling back to default connection: {exc}",
-                read_only=read_only,
-                exc=str(exc),
-            )
-            self._con = duckdb.connect(str(self._db_path))
-
-        if not read_only:
+        if read_only:
+            self._con = self._open_readonly()
+        else:
+            try:
+                self._con = duckdb.connect(str(self._db_path))
+            except Exception as exc:
+                raise RuntimeError(f"Cannot open DuckDB for writing at {self._db_path}: {exc}") from exc
             self._bootstrap()
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _open_readonly(self) -> duckdb.DuckDBPyConnection:
+        """Open a read-only connection, falling back to a temp-file copy when
+        another process holds an exclusive write lock on the original file.
+
+        DuckDB does not allow *any* new connections (even read-only) while a
+        writer holds the file lock.  The safe workaround is to copy the file
+        to a temporary location and open the copy read-only — the copy is
+        always consistent because DuckDB flushes fully before every checkpoint.
+        """
+        # 1. Try a direct read-only connection (works if no writer is active).
+        try:
+            con = duckdb.connect(str(self._db_path), read_only=True)
+            logger.debug("Opened DuckDB read-only (direct)", path=str(self._db_path))
+            return con
+        except Exception as exc:
+            err_lower = str(exc).lower()
+            # Catch both cross-process lock conflicts and in-process config
+            # conflicts (DuckDB raises different exception types for each).
+            is_lock_conflict = any(
+                kw in err_lower
+                for kw in ("lock", "conflict", "different configuration", "can't open", "cannot open")
+            )
+            if not is_lock_conflict:
+                raise  # surface unexpected errors immediately
+            logger.warning(
+                "DuckDB conflict detected — opening a temp-file copy for read-only access",
+                path=str(self._db_path),
+                error=str(exc),
+            )
+
+        # 2. Copy the file to a temp path and open the copy read-only.
+        self._cleanup_tmp()
+        import os
+        tmp_fd, tmp_path_str = tempfile.mkstemp(suffix=".duckdb", prefix="te_dashboard_")
+        os.close(tmp_fd)
+        tmp_path = Path(tmp_path_str)
+        wal_path = Path(str(self._db_path) + ".wal")
+        tmp_wal_path = Path(str(tmp_path) + ".wal")
+        try:
+            shutil.copy2(str(self._db_path), str(tmp_path))
+            if wal_path.exists():
+                shutil.copy2(str(wal_path), str(tmp_wal_path))
+            con = duckdb.connect(str(tmp_path), read_only=True)
+            self._tmp_copy = tmp_path
+            logger.info(
+                "Opened DuckDB read-only via temp copy (intelligence runtime is active)",
+                tmp_path=str(tmp_path),
+            )
+            return con
+        except Exception as exc2:
+            tmp_path.unlink(missing_ok=True)
+            tmp_wal_path.unlink(missing_ok=True)
+            raise RuntimeError(
+                f"Cannot open DuckDB for reading at {self._db_path} "
+                f"(lock conflict and temp-copy also failed): {exc2}"
+            ) from exc2
+
+    def _cleanup_tmp(self) -> None:
+        """Remove any leftover temp copy from a previous session."""
+        if self._tmp_copy is not None:
+            try:
+                self._tmp_copy.unlink(missing_ok=True)
+                Path(str(self._tmp_copy) + ".wal").unlink(missing_ok=True)
+            except OSError:
+                pass
+            self._tmp_copy = None
 
     def _bootstrap(self) -> None:
         self._con.execute(
@@ -103,6 +174,10 @@ class DuckDBManager:
         )
 
         # Step 1: Trade outcomes relational table
+        # Idempotent additive migration for databases created before these filters.
+        for column, kind in (("max_holding_minutes", "INTEGER"), ("days_to_expiry", "INTEGER"), ("strike_oi_ratio", "DOUBLE"), ("entry_price", "DOUBLE")):
+            self._con.execute(f"ALTER TABLE signals ADD COLUMN IF NOT EXISTS {column} {kind}")
+
         self._con.execute(
             """
             CREATE TABLE IF NOT EXISTS trade_outcomes (
@@ -187,6 +262,10 @@ class DuckDBManager:
         trade_grade: str,
         filter_passed: bool,
         filter_rejection_reason: str | None = None,
+        max_holding_minutes: int | None = None,
+        days_to_expiry: int | None = None,
+        strike_oi_ratio: float | None = None,
+        entry_price: float | None = None,
     ) -> None:
         """Insert one signal record into DuckDB using a prepared statement."""
         stmt = """
@@ -204,8 +283,12 @@ class DuckDBManager:
             iv_percentile,
             trade_grade,
             filter_passed,
-            filter_rejection_reason
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            filter_rejection_reason,
+            max_holding_minutes,
+            days_to_expiry,
+            strike_oi_ratio,
+            entry_price
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """
         self._con.execute(
             stmt,
@@ -224,6 +307,10 @@ class DuckDBManager:
                 str(trade_grade),
                 bool(filter_passed),
                 str(filter_rejection_reason) if filter_rejection_reason is not None else None,
+                max_holding_minutes,
+                days_to_expiry,
+                strike_oi_ratio,
+                entry_price,
             ],
         )
         logger.debug(
@@ -311,6 +398,18 @@ class DuckDBManager:
         limit_sql = f"LIMIT {limit}" if limit else ""
         return self.query(f"SELECT * FROM signals ORDER BY timestamp DESC {limit_sql}")
 
+    def get_live_signals(self, *, now: datetime | None = None) -> pd.DataFrame:
+        """Passed directional alerts, independently of the 50-row audit window."""
+        now = now or datetime.now(UTC)
+        return self.query(
+            """SELECT signal_id, timestamp, action, strike, expiry, option_type,
+                      entry_price, filter_passed FROM signals
+               WHERE filter_passed = TRUE AND UPPER(action) IN ('BUY_CE', 'BUY_PE')
+                 AND timestamp >= ? AND timestamp <= ?
+               ORDER BY timestamp DESC""",
+            [now - timedelta(seconds=60), now],
+        )
+
     def get_trade_outcomes(self, limit: int | None = None) -> pd.DataFrame:
         """Retrieve recent trade outcome records."""
         limit_sql = f"LIMIT {limit}" if limit else ""
@@ -323,5 +422,9 @@ class DuckDBManager:
         return self._con.execute(sql).df()
 
     def close(self) -> None:
-        """Close DuckDB connection."""
-        self._con.close()
+        """Close DuckDB connection and remove any temp copy used for read-only access."""
+        try:
+            self._con.close()
+        except Exception:
+            pass
+        self._cleanup_tmp()

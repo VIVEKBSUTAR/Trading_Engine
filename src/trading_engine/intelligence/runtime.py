@@ -20,7 +20,6 @@ from ingestion.parser import OptionChainParser
 from ingestion.validators import OptionChainValidator
 from trading_engine.intelligence.engine import LiveIntelligenceEngine
 from trading_engine.intelligence.models import IntelligenceReport, MarketState
-from trading_engine.intelligence.state import MarketStateAggregator
 
 
 @dataclass(slots=True)
@@ -40,7 +39,8 @@ class LiveIntelligenceRuntime:
         self._security = APISecurityGuard(settings.security)
         self._auth = FyersAuthManager(settings.fyers, security_guard=self._security)
         self._client = FyersMarketClient(settings.fyers, auth_manager=self._auth, security_guard=self._security)
-        self._aggregator = MarketStateAggregator()
+        self._engine = LiveIntelligenceEngine(settings)
+        self._aggregator = self._engine.state_aggregator
         self._stream = FyersStream(
             settings.fyers,
             auth_manager=self._auth,
@@ -50,7 +50,6 @@ class LiveIntelligenceRuntime:
         self._fetcher = NSEOptionChainFetcher(settings.api)
         self._parser = OptionChainParser()
         self._validator = OptionChainValidator()
-        self._engine = LiveIntelligenceEngine(settings)
         self._latest_report: IntelligenceReport | None = None
         self._latest_state: MarketState | None = None
 

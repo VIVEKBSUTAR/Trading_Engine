@@ -194,7 +194,7 @@ def test_step3_state_aggregator_flushes_buffer_exceeding_5000_rows(tmp_path: Pat
     assert len(df_read) == 5001
 
 
-def test_step4_live_intelligence_engine_persists_accepted_and_rejected_signals(tmp_path: Path):
+def test_step4_live_intelligence_engine_persists_accepted_and_rejected_signals(tmp_path: Path, current_option_chain):
     """Step 4: LiveIntelligenceEngine writes evaluated setups to DuckDB signals table."""
     db_file = tmp_path / "test_signals.duckdb"
     duckdb_mgr = DuckDBManager(db_file)
@@ -224,6 +224,7 @@ def test_step4_live_intelligence_engine_persists_accepted_and_rejected_signals(t
         }
     ])
 
+    opt_chain_accepted = current_option_chain(opt_chain_accepted, now)
     snapshot_accepted = MarketSnapshotBundle(
         timestamp=now,
         spot_price=24000.0,
@@ -261,6 +262,7 @@ def test_step4_live_intelligence_engine_persists_accepted_and_rejected_signals(t
         }
     ])
 
+    opt_chain_rejected = current_option_chain(opt_chain_rejected, now)
     snapshot_rejected = MarketSnapshotBundle(
         timestamp=now + timedelta(seconds=10),
         spot_price=24000.0,
@@ -285,7 +287,7 @@ def test_step4_live_intelligence_engine_persists_accepted_and_rejected_signals(t
     duckdb_mgr.close()
 
 
-def test_step5_monitor_persists_trade_outcomes_and_uses_65_multiplier(tmp_path: Path):
+def test_step5_monitor_persists_trade_outcomes_and_uses_65_multiplier(tmp_path: Path, option_history):
     """Step 5: LiveTradeMonitor persists outcomes to DuckDB on close and calculates profit with 65 multiplier."""
     db_file = tmp_path / "test_monitor.duckdb"
     duckdb_mgr = DuckDBManager(db_file)
@@ -323,6 +325,7 @@ def test_step5_monitor_persists_trade_outcomes_and_uses_65_multiplier(tmp_path: 
         option_type="CE",
         entry_ask_price=100.0,
         signal_timestamp=now,
+        option_ticks=option_history(now),
     )
 
     trade.current_bid_price = 110.0

@@ -1,0 +1,39 @@
+services:
+  engine:
+    build: .
+    init: true
+    env_file: .env
+    environment:
+      FYERS_USER_ID: ${FYERS_USER_ID:?Set FYERS_USER_ID in .env}
+      FYERS_PIN: ${FYERS_PIN:?Set FYERS_PIN in .env}
+      FYERS_TOTP_SECRET: ${FYERS_TOTP_SECRET:?Set FYERS_TOTP_SECRET in .env}
+      TE_ENVIRONMENT: paper
+      TE_LOG_DIR: /app/logs
+      TE_DUCKDB_PATH: /app/data/cache/metadata.duckdb
+      TE_DASHBOARD_SNAPSHOT_DIR: /app/data/dashboard
+    volumes:
+      - ./.env:/app/.env
+      - ./data:/app/data
+      - ./logs:/app/logs
+    stop_grace_period: 30s
+  dashboard:
+    build: .
+    init: true
+    entrypoint: ["python", "-m", "streamlit", "run", "src/trading_engine/dashboard/1_Execution_Desk.py"]
+    command: ["--server.address=0.0.0.0", "--server.port=8501", "--server.headless=true"]
+    ports:
+      - "8501:8501"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8501/_stcore/health', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    environment:
+      TE_DASHBOARD_SNAPSHOT_DIR: /app/data/dashboard
+      TE_LOG_DIR: /app/logs
+    volumes:
+      - ./data:/app/data:ro
+      - ./logs:/app/logs
+    depends_on:
+      engine:
+        condition: service_started

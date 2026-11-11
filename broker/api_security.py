@@ -136,11 +136,26 @@ class APISecurityGuard:
         self._last_success_at = datetime.now(UTC)
 
     def register_rest_failure(self, reason: str) -> None:
+        """Record a REST call failure.
+
+        ``safe_mode`` is only triggered when **Fyers broker API** calls fail
+        repeatedly — not for external data-source failures (NSE scraper, market
+        closed, etc.).  Callers that want to record a non-broker failure without
+        risking a safe-mode lockout should pass ``broker=False``.
+        """
         self._rest_failures += 1
         self._last_error_at = datetime.now(UTC)
         self._notes.append(reason)
-        if self._rest_failures >= 3:
-            self.mark_safe_mode("Repeated API failures")
+        # Only count genuine broker-API failures toward the safe-mode threshold.
+        # NSE fetch failures, market-closed conditions, and similar external
+        # issues are logged here but do not lock out the streaming engine.
+        reason_lower = reason.lower()
+        is_external_source = any(
+            kw in reason_lower
+            for kw in ("option_chain_refresh_failed", "nse", "fetch", "404", "not found", "market")
+        )
+        if not is_external_source and self._rest_failures >= 3:
+            self.mark_safe_mode("Repeated Fyers API broker failures")
 
     def validate_fresh_timestamp(self, timestamp: datetime | None, *, max_age_seconds: int, label: str) -> None:
         if timestamp is None:
@@ -157,12 +172,31 @@ class APISecurityGuard:
             raise APISecurityError(f"Stale {label}: {age.total_seconds():.1f}s old")
 
     def validate_quote_payload(self, quote: dict[str, Any], *, instrument: str) -> None:
+        """Validate that a Fyers raw quote dict contains a usable last price.
+
+        Fyers sends the last-traded price as ``lp`` in the ``v`` sub-dict.
+        The normalised ``last_price`` key only exists after client-side parsing.
+        When the exchange is closed the API returns ``lp=0`` rather than
+        omitting the field entirely; a zero price is treated the same as
+        a missing price. We do NOT trigger safe-mode for a closed-market
+        condition — that would block all subsequent requests on weekends or
+        public holidays.
+        """
         if not isinstance(quote, dict):
             raise APISecurityError(f"Invalid quote payload for {instrument}")
         self.validate_instrument_identifier(instrument)
-        if quote.get("last_price") is None:
-            self.mark_safe_mode(f"Missing last price for {instrument}")
-            raise APISecurityError(f"Missing last price for {instrument}")
+        # Fyers raw field is "lp"; normalised alias is "last_price"
+        raw_lp = quote.get("lp") or quote.get("last_price")
+        try:
+            lp_float = float(raw_lp) if raw_lp is not None else None
+        except (TypeError, ValueError):
+            lp_float = None
+        if not lp_float:
+            # Do NOT mark safe-mode: closed market is not an integrity breach
+            raise APISecurityError(
+                f"Missing last price for {instrument} "
+                f"(market may be closed or instrument not available)"
+            )
 
     def validate_stream_frame(self, frame: pd.DataFrame) -> list[str]:
         if frame is None or frame.empty:

@@ -166,7 +166,7 @@ def test_monitor_profit_calculation():
     assert profit == pytest.approx(2600.0)
 
 
-def test_monitor_update_with_fresh_option_ticks():
+def test_monitor_update_with_fresh_option_ticks(option_history):
     """Step 3 & 4: Monitor updates marks and calculates PnL using option ticks."""
     monitor = LiveTradeMonitor(MonitorConfig())
     now = datetime.now(UTC)
@@ -182,6 +182,7 @@ def test_monitor_update_with_fresh_option_ticks():
         option_type="CE",
         entry_ask_price=100.0,
         signal_timestamp=now,
+        option_ticks=option_history(now),
     )
     assert trade.instrument_token == 5555
 
@@ -204,7 +205,7 @@ def test_monitor_update_with_fresh_option_ticks():
     assert profit == pytest.approx(650.0)
 
 
-def test_monitor_stale_data_circuit_breaker():
+def test_monitor_stale_data_circuit_breaker(option_history):
     """Step 5: Tick older than 2.0s triggers stale circuit breaker, freezing evaluation."""
     monitor = LiveTradeMonitor(MonitorConfig())
     now = datetime.now(UTC)
@@ -220,6 +221,7 @@ def test_monitor_stale_data_circuit_breaker():
         option_type="CE",
         entry_ask_price=100.0,
         signal_timestamp=now,
+        option_ticks=option_history(now),
     )
 
     # Provide a stale tick older than 2 seconds (e.g. 5 seconds ago) with bid below stop loss

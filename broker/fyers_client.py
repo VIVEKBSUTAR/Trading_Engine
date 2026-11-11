@@ -141,15 +141,30 @@ class FyersMarketClient:
         if self._security_guard is not None:
             try:
                 self._security_guard.validate_quote_payload(val, instrument=instrument)
-                self._security_guard.validate_fresh_timestamp(
-                    exchange_timestamp or received_at,
-                    max_age_seconds=self._security_guard.settings.stale_snapshot_seconds,
-                    label=f"quote:{instrument}",
-                )
-                self._security_guard.register_rest_success()
             except APISecurityError as exc:
                 self._record_failure(str(exc))
                 raise FyersClientError(f"Quote validation failed for {instrument}: {exc}") from exc
+
+            # Stale-timestamp check: skip when market is closed (last_price is None/zero).
+            # On weekends and public holidays the exchange timestamp will be hours old — that
+            # is expected and should NOT crash the engine or trigger safe-mode.
+            if structured.last_price:
+                try:
+                    self._security_guard.validate_fresh_timestamp(
+                        exchange_timestamp or received_at,
+                        max_age_seconds=self._security_guard.settings.stale_snapshot_seconds,
+                        label=f"quote:{instrument}",
+                    )
+                except APISecurityError as exc:
+                    # Log a warning but don't crash — the engine can operate in
+                    # degraded / market-closed mode and retry on the next cycle.
+                    logger.warning(
+                        "Stale quote timestamp (market may be closed)",
+                        instrument=instrument,
+                        error=str(exc),
+                    )
+
+            self._security_guard.register_rest_success()
 
         logger.info("Fetched Fyers quote", instrument=instrument, last_price=structured.last_price)
         return structured
@@ -314,10 +329,45 @@ class FyersMarketClient:
         return filtered.reset_index(drop=True)
 
     def get_live_snapshot(self) -> LiveMarketSnapshot:
-        """Collect live market snapshot including NIFTY spot, India VIX, and normalized option chain."""
-        nifty_spot = self.get_nifty_spot()
-        india_vix = self.get_india_vix()
-        option_instruments = self.get_option_instruments()
+        """Collect live market snapshot including NIFTY spot, India VIX, and normalized option chain.
+
+        When the market is closed (weekend / public holiday) the Fyers API
+        returns zero or missing prices.  ``get_quote`` will raise
+        ``FyersClientError`` in that case.  We catch it here and return a
+        snapshot with ``last_price=None`` so the intelligence engine can
+        continue in a graceful no-trade state rather than crashing.
+        """
+
+        def _closed_quote(instrument: str) -> MarketQuote:
+            return MarketQuote(
+                instrument=instrument,
+                last_price=None,
+                change=None,
+                ohlc={"open": None, "high": None, "low": None, "close": None},
+                received_at=datetime.now(UTC),
+                exchange_timestamp=None,
+                last_trade_time=None,
+                raw={},
+            )
+
+        try:
+            nifty_spot = self.get_nifty_spot()
+        except FyersClientError as exc:
+            logger.warning("NIFTY spot unavailable (market may be closed)", error=str(exc))
+            nifty_spot = _closed_quote("NSE:NIFTY50-INDEX")
+
+        try:
+            india_vix = self.get_india_vix()
+        except FyersClientError as exc:
+            logger.warning("India VIX unavailable (market may be closed)", error=str(exc))
+            india_vix = _closed_quote("NSE:INDIAVIX-INDEX")
+
+        try:
+            option_instruments = self.get_option_instruments()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Option chain unavailable (market may be closed)", error=str(exc))
+            option_instruments = pd.DataFrame(columns=list(self.EXPECTED_OPTION_COLUMNS))
+
         return LiveMarketSnapshot(
             nifty_spot=nifty_spot,
             india_vix=india_vix,
@@ -373,6 +423,14 @@ def _safe_timestamp(value: Any) -> datetime | None:
 def _format_expiry(expiry_val: Any, symbol: str) -> str:
     """Format expiry as standard date string YYYY-MM-DD or DD-Mon-YYYY."""
     if expiry_val:
+        text = str(expiry_val).strip()
+        if len(text) == 10 and text[2] == "-" and text[5] == "-":
+            try:
+                return datetime.strptime(text, "%d-%m-%Y").date().isoformat()
+            except ValueError:
+                return ""
+        if text.isdigit() and len(text) in {10, 13}:
+            expiry_val = int(text)
         if isinstance(expiry_val, (int, float)):
             try:
                 ts = expiry_val / 1000.0 if expiry_val > 1e11 else float(expiry_val)

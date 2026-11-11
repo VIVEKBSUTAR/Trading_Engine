@@ -12,9 +12,12 @@ authors = [{ name = "Trading Engineering Team" }]
 dependencies = [
   "pandas>=2.2.0",
   "numpy>=1.26.0",
-  "requests>=2.32.0",
+  # Fyers SDK 3.2.1 requires requests==2.31.0.
+  "requests>=2.31.0,<3",
+  "pyotp>=2.9.0",
   "python-dotenv>=1.0.1",
   "kiteconnect>=5.2.0",
+  "fyers-apiv3>=3.2.1",
   "scikit-learn>=1.5.0",
   "vectorbt>=0.27.0",
   "backtrader>=1.9.78.123",
@@ -23,7 +26,7 @@ dependencies = [
   "sqlalchemy>=2.0.0",
   "fastapi>=0.111.0",
   "loguru>=0.7.2",
-  "streamlit>=1.37.0",
+  "streamlit>=1.51.0",
   "plotly>=5.22.0",
   "pydantic>=2.8.0",
   "pydantic-settings>=2.3.0",
@@ -67,6 +70,10 @@ target-version = "py312"
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "UP", "N", "C4", "SIM"]
 ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+"src/trading_engine/dashboard/1_Execution_Desk.py" = ["N999"]
+"src/trading_engine/dashboard/pages/2_Analytics_And_Logs.py" = ["N999"]
 
 [tool.mypy]
 python_version = "3.12"

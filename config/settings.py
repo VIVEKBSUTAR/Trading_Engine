@@ -81,6 +81,9 @@ class FyersSettings:
     redirect_uri: str = "https://127.0.0.1"
     access_token: str | None = None
     auth_code: str | None = None
+    user_id: str | None = field(default=None, repr=False)
+    pin: str | None = field(default=None, repr=False)
+    totp_secret: str | None = field(default=None, repr=False)
     token_store_path: Path | None = None
     reconnect: bool = True
     reconnect_max_tries: int = 50
@@ -90,6 +93,20 @@ class FyersSettings:
     stream_symbols: tuple[str, ...] = ()
     stream_mode: str = "full"
     litemode: bool = False
+
+    def validate_headless_auth(self) -> None:
+        """Headless deployment requires account credentials; research does not."""
+        required = {
+            "FYERS_CLIENT_ID": self.client_id,
+            "FYERS_SECRET_KEY": self.secret_key,
+            "FYERS_REDIRECT_URI": self.redirect_uri,
+            "FYERS_USER_ID": self.user_id,
+            "FYERS_PIN": self.pin,
+            "FYERS_TOTP_SECRET": self.totp_secret,
+        }
+        missing = [key for key, value in required.items() if not value or not value.strip()]
+        if missing:
+            raise ValueError("Headless authentication requires: " + ", ".join(missing))
 
     @property
     def api_key(self) -> str | None:
@@ -255,6 +272,9 @@ class AppSettings:
                 redirect_uri=fyers_redirect_uri,
                 access_token=fyers_access_token,
                 auth_code=fyers_auth_code,
+                user_id=os.getenv("FYERS_USER_ID"),
+                pin=os.getenv("FYERS_PIN"),
+                totp_secret=os.getenv("FYERS_TOTP_SECRET"),
                 token_store_path=token_store_path,
                 reconnect=os.getenv("FYERS_RECONNECT", os.getenv("KITE_RECONNECT", "true")).lower() in {"1", "true", "yes"},
                 reconnect_max_tries=int(os.getenv("FYERS_RECONNECT_MAX_TRIES", os.getenv("KITE_RECONNECT_MAX_TRIES", "50"))),

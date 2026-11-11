@@ -4,7 +4,15 @@ from __future__ import annotations
 
 import signal
 import sys
+from pathlib import Path as _Path
 from threading import Event
+
+# Ensure project root and src/ are on sys.path when run directly:
+# python main.py
+_PROJECT_ROOT = _Path(__file__).resolve().parent
+for _p in [str(_PROJECT_ROOT), str(_PROJECT_ROOT / "src")]:
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 from loguru import logger
 

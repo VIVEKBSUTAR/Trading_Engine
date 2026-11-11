@@ -1,433 +1,179 @@
-# Trading Engine
+# NIFTY Analytical Signal Engine & Terminal
 
-Production-grade algorithmic trading framework for Indian markets, focused on NIFTY 50 index intelligence, options analytics, backtesting, and live broker connectivity.
+A pure analytical signal engine powered by Fyers API V3 data, with a focused
+Streamlit terminal for NIFTY option alerts and position monitoring. Signals,
+risk plans, positions, and PnL are analytical outputs; they do not establish
+broker orders or fills.
 
-This repository now contains the full live stack: authenticated Kite Connect runtime wiring, NSE option-chain ingestion, rolling market-state aggregation, probabilistic regime-aware signal generation, strike selection, risk planning, live trade monitoring, a Streamlit dashboard, and backtest realism/performance tooling.
+## Two-page terminal
 
-## Current Scope
+**Execution Desk** is the default page (`1_Execution_Desk.py`). Its visual order is:
 
-The project is organized around two operating modes that share the same typed model layer and configuration conventions:
+1. One compact row: Fyers WebSocket status, NIFTY spot, and India VIX.
+2. A fresh passed BUY_CE/BUY_PE alert with action, strike, and option entry premium.
+3. Active positions with green profit/red loss and bold trailing-stop values.
 
-1. Research and historical analysis.
-2. Live market intelligence and broker-aware execution support.
+Equity charts, performance metrics, and historical logs do not appear on this
+page. New alerts toast once per signal ID in a browser session; the current alert
+remains visible only within its 60-second window. When a batch arrives, the newest
+qualifying signal is highlighted and older members of that batch are marked seen.
+Stale publications suppress live alerts and mark cached positions as stale.
 
-The live intelligence engine is intentionally conservative. It is designed to answer a narrow operational question on each refresh: given the current NIFTY spot, India VIX, option-chain context, short-horizon price action, and detected regime, is the market actionable, and if so what side, strike, size, and risk plan should be used.
+**Analytics & Logs** (`pages/2_Analytics_And_Logs.py`) contains Total Profit,
+Closed Trades, Win Rate, and Profit Factor at the top, followed by a Plotly area
+chart with restrained grid lines and hover details. The last 50 signal evaluations
+and a Rejection Reason expander sit below the chart. Deployment performance covers
+the most recent 1,000 analytical outcomes. Use the sidebar to switch pages.
 
-## What Was Added Most Recently
+The root `.streamlit/config.toml` sets a dark theme with green accents, background
+`#0E1117`, and secondary background `#262730`. Both pages refresh every five
+seconds without starting another broker session.
 
-The latest development pass hardened the live intelligence runtime and its documentation footprint. The current implementation includes:
+UI previews were captured with **isolated synthetic fixtures**, not live market
+or account data: [Execution Desk](docs/ui/execution-preview.jpg) and
+[Analytics & Logs](docs/ui/analytics-preview.jpg). These show the alert/position
+hierarchy and the separate performance/chart/audit layout; “Connected” in the
+preview is a fixture value, not evidence of market connectivity.
 
-1. A persistent market-state buffer inside the live intelligence engine so regime and transition logic operate on rolling context instead of a one-shot snapshot.
-2. Config-driven thresholds for trend strength, compression, volatility, trade quality, signal TTL, state-buffer sizing, partial exits, and time stops.
-3. A richer state model with explicit market state, transition, trade grade, volatility state, liquidity state, momentum state, and directional bias.
-4. Signal generation that suppresses low-quality states, trap-heavy regimes, sideways compression, and other low-participation environments.
-5. A live trade monitor that tracks open, closed, partial, expired, stop-loss, trap, and regime-downgrade outcomes.
-6. Dashboard rendering for market state, regime, signal ticket, probabilities, strike selection, open trades, and alert-style lifecycle information.
-7. Backtest realism helpers and stratified performance analytics for more realistic execution evaluation.
-8. Root runtime settings in `config/settings.py` with environment-variable parsing for live intelligence controls.
+## Deployment
 
-## System Architecture
-
-```mermaid
-flowchart LR
-  A[Kite Connect / NSE Data] --> B[Live Snapshot + Tick Stream]
-  B --> C[MarketStateAggregator]
-  C --> D[Live Feature Builder]
-  D --> E[Regime Engine]
-  D --> F[Momentum / Probability Engine]
-  D --> G[Trap Detection Engine]
-  E --> H[Signal Generation Engine]
-  F --> H
-  G --> H
-  H --> I[Strike Selection Engine]
-  H --> J[Risk Management Engine]
-  I --> K[Live Trade Monitor]
-  J --> K
-  K --> L[Intelligence Report]
-  L --> M[Streamlit Dashboard]
-  L --> N[Live Runtime Logs]
-```
-
-The same report object is also suitable for downstream persistence, monitoring, and future automation because it is built from typed dataclasses rather than ad hoc dictionaries.
-
-## Live Intelligence Stack
-
-The live intelligence stack lives under `src/trading_engine/intelligence/` and is centered on a few core objects:
-
-### `MarketSnapshotBundle`
-
-This is the normalized bundle that carries the current live inputs together:
-
-1. Timestamp.
-2. Spot price.
-3. India VIX value.
-4. Spot frame.
-5. VIX frame.
-6. Option-chain frame.
-7. Tick frame.
-8. 1-minute candles.
-9. 5-minute candles.
-
-### `MarketStateAggregator`
-
-The aggregator maintains rolling buffers for:
-
-1. Spot data.
-2. VIX data.
-3. Option-chain rows.
-4. Tick data.
-
-It builds derived candles, session context, regime classification inputs, liquidity context, momentum context, trap heuristics, trade grade, signal TTL, and the final `MarketState` object. The latest version keeps this state persistent across refresh cycles so the engine can reason about continuity rather than isolated points.
-
-### `LiveIntelligenceEngine`
-
-The engine coordinates the live pipeline in this order:
-
-1. Build live features from the current snapshot.
-2. Update or reuse the persistent market state.
-3. Assess traps and fake-breakout risk.
-4. Classify regime and transition stage.
-5. Produce directional probability estimates.
-6. Generate a filtered trading signal.
-7. Select the option strike.
-8. Produce a risk plan.
-9. Update the live trade monitor.
-10. Emit an `IntelligenceReport`.
-
-If the live feature frame is empty, the engine returns a neutral report instead of forcing a trade decision.
-
-### `LiveTradeMonitor`
-
-The monitor tracks live trade lifecycle events and updates state for:
-
-1. New trade opens.
-2. Partial exits.
-3. Stop-loss exits.
-4. Time exits.
-5. Trap exits.
-6. Regime downgrade exits.
-7. Signal expiry.
-8. Trailing stop updates.
-
-### `SignalGenerationEngine`
-
-The signal layer is conservative by design. It rejects states when:
-
-1. Confidence falls below the configured floor.
-2. Trap score exceeds the trap cutoff.
-3. Trade grade is `AVOID`.
-4. Regime is sideways compression or high-noise.
-5. Trade quality is below the configured minimum.
-
-Directional entry is only considered when the probability edge is strong enough and the state is not low-quality.
-
-### `StrikeSelectionEngine`
-
-The strike layer chooses a NIFTY option strike using the current underlying price, the signal direction, and the available option chain. The current design favors a controlled and explainable strike choice over aggressive optimization.
-
-### `RiskManagementEngine`
-
-The risk layer determines whether a trade is allowed and, if so, the quantity, stop, target, and portfolio constraints. It is driven by:
-
-1. Capital.
-2. Risk per trade.
-3. Max capital exposure.
-4. Contract multiplier.
-5. Minimum units.
-6. Max daily loss.
-7. Max trades per day.
-8. Partial exit fraction.
-9. Time-stop minutes.
-
-## Live Runtime
-
-The continuous runtime is implemented in `src/trading_engine/cli/intelligence.py` and `src/trading_engine/intelligence/runtime.py`.
-
-It does the following:
-
-1. Loads environment-backed settings from `config/settings.py`.
-2. Connects to the live data source.
-3. Refreshes the current live market snapshot.
-4. Normalizes tick frames for the state engine.
-5. Builds the intelligence report.
-6. Emits callback notifications for each report.
-7. Handles streaming if `KITE_STREAM_TOKENS` are configured.
-8. Falls back to polling mode when streaming tokens are not present.
-
-The runtime logs are written using `loguru` to both stdout and the configured live log file.
-
-## Dashboard
-
-The dashboard is a Streamlit app located in `src/trading_engine/dashboard/app.py` and launched through `te-dashboard` or `src/trading_engine/cli/dashboard.py`.
-
-It currently renders:
-
-1. Market state summary.
-2. Regime and transition information.
-3. Volatility context.
-4. Session state.
-5. Trade grade and quality score.
-6. Probability panels.
-7. Option-chain snapshot summary.
-8. Signal ticket and TTL information.
-9. Open trade monitor state.
-10. Alert-like notes for lifecycle changes.
-
-## Backtesting and Analytics
-
-The backtesting layer is not a toy wrapper. It now includes more realistic execution assumptions and segmented analytics.
-
-### Execution realism
-
-`src/trading_engine/backtest/realism.py` adds assumptions for:
-
-1. Slippage.
-2. Bid/ask spread effects.
-3. Liquidity penalty.
-4. Delay bars.
-5. Partial fills.
-6. Realistic fill estimation.
-
-### Performance analytics
-
-`src/trading_engine/backtest/analytics.py` provides stratified reporting by:
-
-1. Regime.
-2. Session.
-3. Volatility.
-4. Weekday.
-5. Expiry proximity.
-6. Confidence band.
-7. Trade grade.
-
-### Backtest harness
-
-The benchmark harness under `src/trading_engine/bench/eval_harness.py` can generate backtest-ready aligned data, run the directional backtest when dependencies are available, and persist metrics artifacts.
-
-## Configuration
-
-There are two configuration surfaces in the repo:
-
-1. Root runtime settings in `config/settings.py` for the live NSE/Kite runtime.
-2. YAML-backed research configuration in `src/trading_engine/config/` for the analysis stack.
-
-### Root runtime settings
-
-`config/settings.py` groups settings into:
-
-1. `APISettings` for NSE HTTP endpoints and headers.
-2. `StorageSettings` for raw, processed, and metadata directories.
-3. `SchedulerSettings` for refresh cadence and symbol selection.
-4. `LoggingSettings` for log sinks and retention.
-5. `KiteSettings` for auth, reconnect behavior, and streaming tokens.
-6. `SecuritySettings` for environment separation, freshness, rate limits, and safe mode.
-7. `IntelligenceSettings` for live signal and state thresholds.
-8. `RiskSettings` for capital and exposure controls.
-
-Key intelligence environment variables currently supported include:
-
-1. `TE_STATE_BUFFER_ROWS`
-2. `TE_BULLISH_PROB_THRESHOLD`
-3. `TE_BEARISH_PROB_THRESHOLD`
-4. `TE_TRAP_PROB_THRESHOLD`
-5. `TE_CONFIDENCE_FLOOR`
-6. `TE_TREND_STRENGTH_THRESHOLD`
-7. `TE_COMPRESSION_THRESHOLD`
-8. `TE_VOLATILITY_HIGH_THRESHOLD`
-9. `TE_TRADE_QUALITY_THRESHOLD`
-10. `TE_BREAKOUT_LOOKBACK_BARS`
-11. `TE_STRUCTURE_LOOKBACK_BARS`
-12. `TE_MAX_TRADES_PER_DAY`
-13. `TE_MAX_DAILY_LOSS_PCT`
-14. `TE_DASHBOARD_REFRESH_SECONDS`
-15. `TE_DEFAULT_EXPIRY_DAYS`
-16. `TE_PARTIAL_EXIT_FRACTION`
-17. `TE_TIME_STOP_MINUTES`
-18. `TE_SIGNAL_TTL_MIN_CANDLES`
-19. `TE_SIGNAL_TTL_MAX_CANDLES`
-
-Broker/runtime variables include:
-
-1. `KITE_API_KEY`
-2. `KITE_API_SECRET`
-3. `KITE_ACCESS_TOKEN`
-4. `KITE_REQUEST_TOKEN`
-5. `KITE_TOKEN_STORE_PATH`
-6. `KITE_RECONNECT`
-7. `KITE_RECONNECT_MAX_TRIES`
-8. `KITE_RECONNECT_MAX_DELAY`
-9. `KITE_CONNECT_TIMEOUT`
-10. `KITE_STREAM_TOKENS`
-11. `KITE_STREAM_MODE`
-12. `TE_ENVIRONMENT`
-13. `TE_ALLOW_LIVE_EXECUTION`
-14. `TE_REQUIRE_MANUAL_EXECUTION_APPROVAL`
-15. `TE_API_REQUESTS_PER_MINUTE`
-16. `TE_SECURITY_REQUEST_TIMEOUT_SECONDS`
-17. `TE_STALE_SNAPSHOT_SECONDS`
-18. `TE_STALE_OPTION_CHAIN_SECONDS`
-19. `TE_STALE_STREAM_SECONDS`
-20. `TE_STREAM_HEARTBEAT_TIMEOUT_SECONDS`
-21. `TE_RECONNECT_COOLDOWN_SECONDS`
-22. `TE_MAX_RECONNECT_ATTEMPTS`
-23. `TE_MAX_DUPLICATE_TICKS`
-24. `TE_MAX_OUT_OF_ORDER_TICKS`
-25. `TE_MAX_PAYLOAD_AGE_SECONDS`
-
-### YAML research configuration
-
-The research config loader in `src/trading_engine/config/settings.py` reads `configs/base.yaml` and validates it through Pydantic models. That layer still primarily covers ingestion, storage, logging, and environment scaffolding for the research pipeline.
-
-## Installation
+Use Docker with Compose, then run from the repository root:
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -e ".[dev]"
 cp .env.example .env
+chmod 600 .env
+# Fill in the Fyers credentials and registered redirect URI.
+docker compose up --build
 ```
 
-After that, fill in `.env` with your local values for Kite Connect, data paths, and intelligence tuning.
+Open [the terminal](http://localhost:8501). The default view is Execution Desk;
+Analytics & Logs is the secondary sidebar page.
 
-## How To Run
+Required headless settings: `FYERS_CLIENT_ID`, `FYERS_SECRET_KEY`,
+`FYERS_REDIRECT_URI`, `FYERS_USER_ID`, `FYERS_PIN`, and `FYERS_TOTP_SECRET`.
+Keep the PIN as a string to preserve leading zeros. Optional
+`FYERS_STREAM_SYMBOLS` can specify contracts; otherwise nearby contracts are
+discovered at startup. Synchronize the host clock for TOTP.
 
-1. Activate the environment:
+Engine startup generates today's token, overwrites `FYERS_ACCESS_TOKEN` in the
+bind-mounted local `.env`, verifies its generation timestamp, and explicitly loads
+the new value before execing `te-intelligence`. A failed login stops startup.
+Tokens refresh on startup only: restart engine after the provider's daily expiry.
+The SSO endpoints are undocumented and still require account-level validation.
+
+The Python 3.12 slim image installs non-editably. `engine` owns the DuckDB writer
+and publishes `./data/dashboard/latest.json` atomically. `dashboard` reads that
+publication without receiving account credentials, opening the writer's database,
+or starting a second analytical runtime. Both services mount data/log directories;
+dashboard data access is read-only. Its healthcheck verifies the HTTP service,
+not market connectivity.
+
+The engine queries DuckDB separately for passed directional signals timestamped
+within the last 60 seconds. This alert window is independent of the 50-row audit
+log. Signals now persist `entry_price` from the selected option ask; old records
+have NULL rather than substituting index spot. Rebuild both services together to
+use the expanded publication fields for health, option premiums, and positions.
+
+## Local installation and checks
+
+Use Python 3.12 or newer. Run from the repository root so the Streamlit theme is
+loaded:
 
 ```bash
+python3 -m venv .venv
 source .venv/bin/activate
+python -m pip install -e '.[dev]'
+PYTHONPATH=src:. te-dashboard
 ```
 
-2. Start the institutional dashboard:
+The launcher now opens `src/trading_engine/dashboard/1_Execution_Desk.py`.
+Set `TE_DASHBOARD_SNAPSHOT_DIR` to the engine publication directory. Without an
+explicit setting, local mode first looks in `data/dashboard`; otherwise it can
+read historical DuckDB data. A database-only view cannot establish websocket
+health or active positions. It shows unavailable fields explicitly.
 
 ```bash
-te-dashboard
+PYTHONPATH=src:. te-intelligence
+PYTHONPATH=src:. python -m pytest tests -q
 ```
 
-If `te-dashboard` is not on your PATH yet, install the package in editable mode first with `pip install -e ".[dev]"`.
+Offline verification: **108 tests and 5 subtests pass**. Changed-code lint and the
+non-editable wheel build pass; both page scripts are present in the wheel. Browser
+review used synthetic fixtures. Docker and live-account validation remain pending;
+see `project_status.md` for exact operational status. The requested
+`docker compose up --build` attempt exited 127 (`docker: command not found`).
+The Docker launcher symlink points to an absent Docker Desktop binary. The
+terminal is **not live**; restore/install Docker Desktop, then rerun the command.
 
-If you prefer a direct Streamlit launch, the dashboard entrypoint is `src/trading_engine/dashboard/app.py`.
+## Isolated live websocket validation
 
-3. Start the live intelligence runtime:
+Export `FYERS_CLIENT_ID` and `FYERS_ACCESS_TOKEN` securely, then run during an
+active market session:
 
 ```bash
-te-intelligence
+python live_fire_test.py --timeout 120
 ```
 
-4. If you only want the authenticated Kite runtime:
+The script reads environment variables directly, discovers current-expiry ATM
+CE/PE symbols, prints exactly 50 combined option updates, and closes cleanly.
+It does not initialize the engine or load `.env` itself. Connection/subscription
+acknowledgements do not count as ticks. Success proves data connectivity, not
+signal accuracy or fills.
 
-```bash
-te-kite-live
-```
+## Analytical logic and limitations
 
-5. For a quick validation check before running live, compile the project:
+- Index spot supplies direction/strike context. Long-option valuation enters at
+  ask and marks/exits at bid for the selected token.
+- Spread rejection defaults to `(ask - bid) / bid > 0.05`; IV rejection uses the
+  rolling 90th percentile. Prior missing-quote/IV and warm-up bypasses remain.
+- DTE uses the snapshot's Asia/Kolkata date and selected contract expiry. Expiry
+  day carries a 15-minute holding cap; later days carry 45 minutes. Invalid,
+  missing, or expired contracts fail closed.
+- The same-strike/same-expiry PE/CE OI ratio rejects BUY_CE below 0.8 and BUY_PE
+  above 1.2. Missing or invalid OI fails closed.
+- ATR uses 14 completed contiguous one-minute midpoint bars with true-range gaps.
+  Initial stop is ask minus 1.5 ATR; at 1R profit trailing follows bid minus one
+  ATR without widening. The premium target is ask plus 3 ATR. Insufficient ATR
+  history suppresses admission. Signal TTL and holding lifetime are separate.
+- Runtime, engine, and monitor share tick history. Stops/time limits require fresh
+  option updates; missing/stale data freezes valuation and cannot establish an
+  executable exit. A stale terminal never claims a healthy websocket.
+- DuckDB stores decisions and analytical outcomes. Raw ticks flush to Parquet
+  above 5,000 rows per token. Existing failed-writer buffer clearing, reused part
+  filenames, shutdown flushing, and lot-size/sizing assumptions need hardening.
 
-```bash
-PYTHONPATH=src:. .venv/bin/python -m compileall -q src broker config main.py
-```
+Historical research, backtesting, and model utilities remain available. The full
+runtime combines Fyers websocket/REST with supplementary NSE option-chain data.
+The Fyers 3.2.1 SDK pins requests 2.31.0; the project range accommodates it.
+Plotly was already declared and remains required; Streamlit now requires at least
+1.51 for the terminal's table font-weight support.
 
-The dashboard is the best place to monitor the terminal-style market state view, signal ticket, alerts, open trade monitor, and option-chain intelligence. The live runtime is what refreshes the engine continuously.
+## Documentation protocol
 
-## API Security
+Every completed development phase must update `decision.md`, this `README.md`,
+and `project_status.md` together. Record architecture, actual system state,
+validation evidence, pending work, and live-market consequences. `AGENTS.md`
+persists the rule. Offline tests and UI previews do not establish live readiness.
 
-The live stack now prefers safe failure over execution. If the environment is not `live` or `paper`, if manual approval is required, if REST requests exceed the configured limit, or if websocket / snapshot data becomes stale, the runtime drops into safe mode and suppresses execution.
+Next pending task: **Live-fire deployment and real-time AWS EC2/VPS observation.**
 
-The most important live-control variables are `TE_ENVIRONMENT`, `TE_ALLOW_LIVE_EXECUTION`, `TE_REQUIRE_MANUAL_EXECUTION_APPROVAL`, `TE_API_REQUESTS_PER_MINUTE`, `TE_STALE_SNAPSHOT_SECONDS`, `TE_STALE_OPTION_CHAIN_SECONDS`, and `TE_STALE_STREAM_SECONDS`.
+Reference: [Streamlit multipage directory architecture](https://docs.streamlit.io/develop/concepts/multipage-apps/overview)
+and [styled dataframe support](https://docs.streamlit.io/1.51.0/develop/api-reference/data/st.dataframe).
 
-The dashboard exposes live API health so you can see when execution is blocked, when reconnects spike, and when ticks or snapshots are stale.
+The deployment files are directly in the repository root: `docker-compose.yml`,
+`Dockerfile`, and executable `entrypoint.sh`. Their paths, service definitions,
+port/mount configuration, and auth-before-daemon startup order have been verified.
+Compose loads `.env` for engine; dashboard consumes engine publications without
+account secrets. Start Compose from this same root directory.
 
-## Commands
 
-The package exports these entrypoints:
+The canonical local checkout on this laptop is
+`/Volumes/APFS/projects/trading_engine`. Source/configuration/documentation changes
+from this chat are synchronized there before publication to
+[VIVEKBSUTAR/Trading_Engine](https://github.com/VIVEKBSUTAR/Trading_Engine). Local
+credentials, datasets, logs, and databases remain outside Git.
 
-```bash
-te-ingest
-te-train
-te-infer
-te-eval
-te-nse-ingest
-te-kite-live
-te-dashboard
-te-intelligence
-```
-
-### `te-intelligence`
-
-Starts the continuous live intelligence loop. It polls or streams data, refreshes the market state, generates reports, logs each update, and keeps the trade monitor in sync.
-
-### `te-dashboard`
-
-Starts the Streamlit dashboard that visualizes the current live intelligence state.
-
-### `te-kite-live`
-
-Starts the authenticated Kite Connect runtime and websocket stream handler.
-
-### Other command-line tools
-
-1. `te-ingest` runs historical ingestion.
-2. `te-train` runs model training.
-3. `te-infer` runs inference.
-4. `te-eval` runs the benchmark harness.
-5. `te-nse-ingest` routes through the current NSE ingestion runtime.
-
-## Live Flow
-
-The live execution path is currently:
-
-1. Authenticate with Kite Connect.
-2. Load environment-backed runtime settings.
-3. Fetch a live snapshot for NIFTY spot, India VIX, and the option chain.
-4. Refresh the rolling tick and candle buffers.
-5. Derive live features from the snapshot and short-horizon windows.
-6. Build or update the market state.
-7. Classify trend, volatility, session, liquidity, momentum, regime, and transition stage.
-8. Score directional probabilities.
-9. Detect traps, fake breakouts, stoploss hunts, and liquidity grabs.
-10. Filter low-quality or sideways states.
-11. Select the strike.
-12. Build the risk plan.
-13. Update live trade lifecycle state.
-14. Emit the report to the dashboard and runtime logs.
-
-## Project Layout
-
-```text
-config/                  root runtime settings for live NSE/Kite execution
-configs/                 YAML research configuration
-main.py                  live broker/NSE entrypoint
-broker/                  Kite auth, client, websocket, and normalization helpers
-src/trading_engine/
-  backtest/              execution realism, metrics, and stratified analytics
-  bench/                 benchmark and evaluation harnesses
-  cli/                   command-line entrypoints
-  common/                shared logging and infrastructure helpers
-  config/                YAML-backed research config models and loaders
-  dashboard/             Streamlit app for live intelligence
-  data/                  historical ingest and cleanup utilities
-  features/              research feature engineering
-  intelligence/          live market state, signals, strike, risk, monitor, runtime
-  ml/                    walk-forward model training and inference
-tests/                   unit and integration tests
-```
-
-## Operational Notes
-
-1. Live NSE endpoints are sensitive to headers, cookies, and warm-up behavior.
-2. Kite access tokens should remain local and should not be committed.
-3. The intelligence engine defaults to a conservative no-trade stance when the market state is empty or low-quality.
-4. The live runtime and the research stack are intentionally separate but share common typed models and reporting conventions.
-5. The backtest helpers are meant to reduce optimism bias by modeling execution cost and fill realism.
-
-## Validation
-
-The repository currently compiles cleanly with:
-
-```bash
-PYTHONPATH=src:. .venv/bin/python -m compileall -q src broker config main.py
-```
-
-The live intelligence engine has also been smoke-tested on an empty snapshot and returns a neutral report instead of crashing, which is the expected behavior for sparse input.
-
-## Development Status
-
-The project is actively evolving toward a production-grade intraday NIFTY intelligence engine. The current implementation already includes live broker integration, live market-state aggregation, regime-aware scoring, trap suppression, strike selection, risk control, dashboard rendering, and backtest realism. The remaining work is mostly around test depth, research config alignment, and incremental hardening.
+The combined local/root changes pass 108 tests and 5 subtests. ATR lifecycle tests
+use a deterministic intraday clock so running the suite around midnight in India
+does not mistake the expected session warm-up for a regression. The canonical
+checkout retains local broker/storage fixes alongside this chat's upgrades.

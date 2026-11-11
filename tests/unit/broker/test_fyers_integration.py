@@ -274,6 +274,7 @@ class TestStep5RuntimeAndMain:
     def test_runtime_initializes_with_fyers_and_refreshes_snapshot(self, tmp_path: Path) -> None:
         app_settings = AppSettings.from_env(project_root=tmp_path)
         app_settings.fyers.access_token = "MOCK_TOKEN"
+        app_settings.fyers.client_id = "APP-100"
 
         mock_spot = MarketQuote(
             instrument="NSE:NIFTY50-INDEX",

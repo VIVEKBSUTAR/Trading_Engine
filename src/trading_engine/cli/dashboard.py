@@ -9,7 +9,7 @@ from pathlib import Path
 
 def main() -> int:
     """Launch Streamlit using the packaged dashboard app."""
-    app_path = Path(__file__).resolve().parents[1] / "dashboard" / "app.py"
+    app_path = Path(__file__).resolve().parents[1] / "dashboard" / "1_Execution_Desk.py"
     command = [sys.executable, "-m", "streamlit", "run", str(app_path)]
     return subprocess.call(command)
 

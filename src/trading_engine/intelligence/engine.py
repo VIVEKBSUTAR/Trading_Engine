@@ -80,6 +80,7 @@ class LiveIntelligenceEngine:
                 signal_ttl_max_candles=settings.intelligence.signal_ttl_max_candles,
             )
         )
+        self._monitor.state_aggregator = self._state_aggregator
         self._regime_engine = MarketRegimeEngine(
             RegimeEngineConfig(
                 trend_strength_threshold=settings.intelligence.trend_strength_threshold,
@@ -185,6 +186,7 @@ class LiveIntelligenceEngine:
             probabilities=probabilities,
             trap=trap,
             option_chain=snapshot.option_chain_frame,
+            snapshot_timestamp=snapshot.timestamp,
         )
         latency.signal_generated_at = datetime.now(UTC)
 
@@ -224,6 +226,7 @@ class LiveIntelligenceEngine:
                 chosen_strike=chosen_strike,
                 chosen_expiry=chosen_expiry,
                 chosen_side=chosen_side,
+                entry_price=ask_price if signal.action != SignalAction.NO_TRADE and ask_price > 0 else None,
             )
 
         # Update state aggregator with fresh option bid/ask ticks for tracked instruments
@@ -256,7 +259,7 @@ class LiveIntelligenceEngine:
             and signal.action != SignalAction.NO_TRADE
             and not any(trade.signal.action == signal.action for trade in self._monitor.open_trades)
         ):
-            self._monitor.open_trade_from_signal(
+            opened = self._monitor.open_trade_from_signal(
                     signal,
                     quantity=risk.quantity,
                     instrument_token=token,
@@ -265,6 +268,10 @@ class LiveIntelligenceEngine:
                     expiry=chosen_expiry,
                     option_type=chosen_side,
                 )
+            if opened is not None:
+                signal.entry_reference = opened.entry_ask_price
+                risk.stop_loss = opened.stop_loss_price
+                risk.target = signal.target
 
         # Evaluate trade monitor using actual option tick data instead of underlying spot price
         option_ticks = self._state_aggregator.get_option_token_ticks()
@@ -425,6 +432,7 @@ class LiveIntelligenceEngine:
         chosen_strike: float | None = None,
         chosen_expiry: str | None = None,
         chosen_side: str | None = None,
+        entry_price: float | None = None,
     ) -> None:
         """Write evaluated signal record to DuckDB signals table."""
         if self._duckdb_manager is None:
@@ -472,6 +480,10 @@ class LiveIntelligenceEngine:
                 trade_grade=signal.trade_grade.value if hasattr(signal.trade_grade, "value") else str(signal.trade_grade),
                 filter_passed=filter_passed,
                 filter_rejection_reason=rejection_reason,
+                max_holding_minutes=signal.max_holding_minutes,
+                days_to_expiry=signal.days_to_expiry,
+                strike_oi_ratio=signal.strike_oi_ratio,
+                entry_price=entry_price,
             )
         except Exception as exc:  # noqa: BLE001
             logger.error("Failed to persist signal to DuckDB", signal_id=sig_id, error=str(exc))

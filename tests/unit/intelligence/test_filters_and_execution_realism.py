@@ -126,7 +126,7 @@ def test_step3_intelligence_settings_defaults():
     assert app_settings.intelligence.max_implied_volatility_percentile == pytest.approx(0.90)
 
 
-def test_step1_liquidity_filter_rejects_wide_spread():
+def test_step1_liquidity_filter_rejects_wide_spread(current_option_chain):
     """Step 1: Spread percentage (ask - bid) / bid > 0.05 returns NO_TRADE signal."""
     engine = SignalGenerationEngine(SignalEngineConfig(max_spread_percentage=0.05))
     state = _make_state(24000.0)
@@ -145,6 +145,7 @@ def test_step1_liquidity_filter_rejects_wide_spread():
             "expiry": "2026-10-22",
         }
     ])
+    option_chain = current_option_chain(option_chain, state.timestamp)
 
     # Check direct filter method
     passed, spread_pct, reason = engine.check_liquidity_filter(24000.0, OptionSide.CE, option_chain)
@@ -164,7 +165,7 @@ def test_step1_liquidity_filter_rejects_wide_spread():
     assert any("liquidity filter" in r.lower() for r in signal.reasoning)
 
 
-def test_step1_liquidity_filter_accepts_tight_spread():
+def test_step1_liquidity_filter_accepts_tight_spread(current_option_chain):
     """Step 1: Spread percentage (ask - bid) / bid <= 0.05 passes and emits trade."""
     engine = SignalGenerationEngine(SignalEngineConfig(max_spread_percentage=0.05))
     state = _make_state(24000.0)
@@ -183,6 +184,7 @@ def test_step1_liquidity_filter_accepts_tight_spread():
             "expiry": "2026-10-22",
         }
     ])
+    option_chain = current_option_chain(option_chain, state.timestamp)
 
     passed, spread_pct, reason = engine.check_liquidity_filter(24000.0, OptionSide.CE, option_chain)
     assert passed is True
@@ -198,7 +200,7 @@ def test_step1_liquidity_filter_accepts_tight_spread():
     assert signal.action == SignalAction.BUY_CE
 
 
-def test_step2_volatility_filter_rejects_top_decile_iv():
+def test_step2_volatility_filter_rejects_top_decile_iv(current_option_chain):
     """Step 2: Implied volatility in 90th percentile or higher returns NO_TRADE signal."""
     engine = SignalGenerationEngine(SignalEngineConfig(max_implied_volatility_percentile=0.90))
     state = _make_state(24000.0)
@@ -219,6 +221,7 @@ def test_step2_volatility_filter_rejects_top_decile_iv():
             "expiry": "2026-10-22",
         }
     ])
+    option_chain = current_option_chain(option_chain, state.timestamp)
 
     # Check direct filter method
     passed, iv_val, percentile, reason = engine.check_volatility_filter(
@@ -241,7 +244,7 @@ def test_step2_volatility_filter_rejects_top_decile_iv():
     assert any("volatility filter" in r.lower() for r in signal.reasoning)
 
 
-def test_step2_volatility_filter_accepts_normal_iv():
+def test_step2_volatility_filter_accepts_normal_iv(current_option_chain):
     """Step 2: Implied volatility below 90th percentile passes and allows trade."""
     engine = SignalGenerationEngine(SignalEngineConfig(max_implied_volatility_percentile=0.90))
     state = _make_state(24000.0)
@@ -261,6 +264,7 @@ def test_step2_volatility_filter_accepts_normal_iv():
             "expiry": "2026-10-22",
         }
     ])
+    option_chain = current_option_chain(option_chain, state.timestamp)
 
     passed, iv_val, percentile, reason = engine.check_volatility_filter(
         24000.0, OptionSide.CE, option_chain, historical_iv_window=historical_iv
