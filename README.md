@@ -292,3 +292,19 @@ are committed from the canonical laptop checkout. Credentials (`.env` and its
 local variants), generated dashboard JSON, market data, and logs are excluded;
 `.env.example` remains a safe configuration template. A Git push publishes code;
 use the documented Docker rebuild separately to activate a release.
+
+## Dashboard clock — Indian Standard Time
+
+Signal audit rows, rejection details, entry/exit alerts, Live Engine Telemetry,
+position Entry Time and Signal Time, and equity-chart labels use Asia/Kolkata.
+Display format: `12 Nov 2026 11:30:07 AM IST` (date, twelve-hour clock, exact
+seconds, AM/PM, literal IST; no ISO offsets). Time in Trade remains a duration.
+Naive timestamps are interpreted as UTC; aware timestamps retain their actual
+instant before conversion. Missing/invalid timestamps display `—`.
+
+DuckDB, engine publications, sorting, and freshness/TTL calculations retain UTC.
+New publications include position opening and signal timestamps; older snapshots
+show `—` for unavailable position times until the updated engine publishes them.
+This presentation change passed all 35 dashboard tests and changed-file lint;
+live deployment/market validation is still pending. Rebuild the Docker services
+to activate the updated dashboard and publication fields.

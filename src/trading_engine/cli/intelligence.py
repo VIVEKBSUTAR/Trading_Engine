@@ -113,6 +113,7 @@ def publish_dashboard_snapshot(directory: Path, report: IntelligenceReport, runt
             "stop_loss": trade.signal.stop_loss, "is_frozen": trade.is_frozen,
             "live_iv": trade.live_iv, "delta": trade.delta,
             "time_in_trade": max(0, (report.timestamp - trade.opened_at).total_seconds() / 60),
+            "opened_at": trade.opened_at.isoformat(), "signal_timestamp": trade.signal_timestamp.isoformat(),
         } for trade in runtime.monitor.open_trades],
     }
     path = None

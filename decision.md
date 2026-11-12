@@ -448,3 +448,26 @@ Validation evidence remains 167 passing Python 3.12 tests plus 5 subtests,
 changed-file lint, and a clean whitespace check. Canonical and workspace source
 files match. Remote publication is verified against the pushed commit; live-fire
 lifecycle deployment and AWS EC2/VPS observation remain pending.
+
+## Dashboard IST presentation — 2026-11-12
+
+Architecture is unchanged. Both Streamlit pages delegate to shared renderers;
+apply one display formatter there rather than converting the DuckDB query output
+or changing engine clocks. `pd.to_datetime(..., utc=True, format="mixed")`
+localizes naive inputs to UTC and normalizes aware inputs without double
+localization. Convert with `.dt.tz_convert("Asia/Kolkata")`, then format a dated
+12-hour clock with seconds, AM/PM, and literal IST. Invalid/missing values show
+an em dash rather than an invented time. Dates preserve midnight rollovers.
+
+Format audit rows, rejection text, lifecycle banners/toasts, telemetry update/tick
+times, and position entry/signal timestamps only at presentation boundaries.
+Publish the latter fields as UTC ISO values for the renderer. Time in Trade is
+still elapsed minutes, and UTC freshness checks precede display formatting.
+Plotly receives IST wall-clock x coordinates with explicit IST tick/hover labels
+so the browser cannot silently substitute another timezone.
+
+Validation: all 35 dashboard tests pass in isolated Python 3.12 with networking
+disabled; changed-file Ruff passes. Tests cover mixed naive/aware timestamps,
+UTC/IST offsets, noon/midnight/day rollover, missing/invalid values, audit/rejection
+rendering, active positions, telemetry, alerts, chart hover, and unchanged UTC
+freshness calculations. No live deployment or market-readiness claim is made.

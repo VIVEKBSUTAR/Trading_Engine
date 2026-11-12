@@ -21,6 +21,22 @@ LIVE_WINDOW_SECONDS = 60
 PUBLICATION_STALE_SECONDS = 30
 
 
+def format_ist_timestamps(values: pd.Series) -> pd.Series:
+    """Treat naive inputs as UTC; preserve aware instants before IST display."""
+    timestamps = pd.to_datetime(values, errors="coerce", utc=True, format="mixed")
+    return timestamps.dt.tz_convert("Asia/Kolkata").dt.strftime("%d %b %Y %I:%M:%S %p IST").fillna("—")
+
+
+def format_ist_timestamp(value: Any) -> str:
+    return str(format_ist_timestamps(pd.Series([value])).iloc[0])
+
+
+def render_telemetry(payload: dict[str, Any]) -> None:
+    """Compact feed timestamps; freshness calculations continue to use UTC."""
+    st.caption(f"Live Engine Telemetry · Updated {format_ist_timestamp(payload.get('timestamp'))}"
+               f" · Last tick {format_ist_timestamp(payload.get('websocket', {}).get('last_tick_at'))}")
+
+
 def inject_styles() -> None:
     st.markdown("""<style>
     .block-container {max-width:1440px;padding-top:1.4rem;padding-bottom:2rem;}
@@ -154,7 +170,7 @@ def render_live_alert(payload: dict[str, Any]) -> None:
     seen = st.session_state.get("seen_lifecycle_alerts", {})
     seen = {key: value for key, value in seen.items() if value >= now.timestamp() - 60}
     for _, event in events.head(10).iterrows():
-        message = f"{event.alert_type} · {str(event.get('action', '')).upper()} · Strike {_number(event.get('strike'), decimals=0)} · Premium {_number(event.get('premium'), prefix='₹')}"
+        message = f"{event.alert_type} · {str(event.get('action', '')).upper()} · Strike {_number(event.get('strike'), decimals=0)} · Premium {_number(event.get('premium'), prefix='₹')} · {format_ist_timestamp(event.get('timestamp'))}"
         (st.error if event["_exit"] else st.success)(message, icon="🔔")
         if event.event_id not in seen:
             st.toast(message, icon="🔔")
@@ -192,6 +208,8 @@ def positions_frame(positions: list[dict[str, Any]]) -> pd.DataFrame:
             "Position": position.get("trade_id"), "Strike": position.get("strike"),
             "Side": position.get("option_type"), "Lots": quantity,
             "Entry Ask": position.get("entry_ask"), "Live Premium": position.get("current_bid"),
+            "Entry Time": format_ist_timestamp(position.get("opened_at")),
+            "Signal Time": format_ist_timestamp(position.get("signal_timestamp")),
             "Time in Trade": position.get("time_in_trade"), "Live IV": position.get("live_iv"),
             "Trailing Stop": position.get("stop_loss"), "Unrealized PnL": pnl,
             "Data": "FROZEN" if position.get("is_frozen") else "Live",
@@ -233,12 +251,14 @@ def _render_active_positions(monitor, report) -> None:
         "stop_loss": trade.signal.stop_loss, "unrealized_pnl": compute_unrealized_pnl(trade),
         "is_frozen": trade.is_frozen, "live_iv": trade.live_iv,
         "time_in_trade": max(0, (datetime.now(UTC) - trade.opened_at).total_seconds() / 60),
+        "opened_at": trade.opened_at, "signal_timestamp": trade.signal_timestamp,
     } for trade in trades])
 
 
 def execution_desk() -> None:
     payload = load_terminal_data()
     render_health(payload)
+    render_telemetry(payload)
     st.title("Execution Desk")
     if payload.get("waiting"):
         st.info(payload.get("error", "Waiting for the engine's first analytical snapshot."))
@@ -263,14 +283,15 @@ def _render_performance_banner(metrics: dict[str, Any]) -> None:
 def equity_figure(trade_outcomes: pd.DataFrame) -> go.Figure:
     equity = compute_equity_curve(trade_outcomes)
     figure = go.Figure(go.Scatter(
-        x=equity["exit_timestamp"], y=equity["cumulative_profit"], mode="lines", fill="tozeroy",
+        x=equity["exit_timestamp"].dt.tz_convert("Asia/Kolkata").dt.tz_localize(None), y=equity["cumulative_profit"], mode="lines", fill="tozeroy",
         line={"color": "#00FF00", "width": 2}, fillcolor="rgba(0,255,0,0.09)",
-        hovertemplate="%{x|%d %b %H:%M}<br>Realized PnL ₹%{y:,.2f}<extra></extra>",
+        customdata=format_ist_timestamps(equity["exit_timestamp"]),
+        hovertemplate="%{customdata}<br>Realized PnL ₹%{y:,.2f}<extra></extra>",
     ))
     figure.update_layout(template="plotly_dark", height=340, showlegend=False,
         margin={"l": 0, "r": 0, "t": 12, "b": 0}, paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
         font={"color": "#98A2B3"}, hovermode="x unified",
-        xaxis={"title": None, "showgrid": False, "zeroline": False, "showline": False},
+        xaxis={"title": None, "tickformat": "%I:%M:%S %p IST", "showgrid": False, "zeroline": False, "showline": False},
         yaxis={"title": None, "gridcolor": "rgba(152,162,179,0.10)", "zerolinecolor": "#3B4350", "tickprefix": "₹"})
     return figure
 
@@ -289,6 +310,8 @@ def render_audit_log(signals: pd.DataFrame) -> None:
         st.info("No signal evaluations recorded yet.")
         return
     signals = signals.copy().head(50)
+    if "timestamp" in signals:
+        signals["timestamp"] = format_ist_timestamps(signals["timestamp"])
     signals = signals.rename(columns={"filter_rejection_reason": "rejection_reason"})
     if "filter_passed" not in signals:
         signals["filter_passed"] = False

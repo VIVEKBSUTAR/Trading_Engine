@@ -1,4 +1,7 @@
-"""Default terminal page: ENTRY_BUY / explicit EXIT alerts, active positions, and system health."""
+"""Execution desk with IST telemetry, lifecycle alerts, and active positions.
+
+Shared renderers format UTC instants as twelve-hour Asia/Kolkata timestamps.
+"""
 import streamlit as st
 
 from trading_engine.dashboard.shared import execution_desk, inject_styles

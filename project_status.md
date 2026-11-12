@@ -2,7 +2,27 @@
 
 Last updated: 2026-11-12 (Asia/Kolkata).
 
-## Current phase: Greeks and lifecycle upgrade — 2026-11-12
+## Current phase: dashboard IST timestamps — 2026-11-12
+
+Built: one shared pandas UTC-to-Asia/Kolkata display formatter; exact seconds in
+a dated twelve-hour AM/PM clock ending in IST; converted signal audit/rejection
+rows, lifecycle alerts/toasts, telemetry timestamps, position Entry Time/Signal
+Time columns, and equity hover/axis labels. Engine snapshots now publish UTC
+position opening and signal times. Missing/invalid/older missing fields show `—`.
+Time in Trade stays in minutes. Storage, UTC freshness windows, and trading
+mathematics are unchanged.
+
+Validation: **35 dashboard tests passed**, including timezone-aware/naive and
+mixed-format inputs, noon/midnight/date rollover, invalid data, all affected
+renderers, and UTC freshness preservation. Changed-file Ruff passes. Tests ran
+in an isolated Python 3.12 container with networking disabled.
+
+Pending: rebuild the engine/dashboard containers and observe the rendered times
+from real Fyers publications; live-fire lifecycle deployment and real-time AWS
+EC2/VPS observation remain pending. This phase changes analytical presentation
+only, with no broker orders or changes to signal timing or exit rules.
+
+## Previous phase: Greeks and lifecycle upgrade — 2026-11-12
 
 Built: signed Delta-near-0.70 strike selection; strict Trap <0.5, aggregate PCR
 >1.5, IV percentile <50 gates; 20-snapshot IV warm-up; explicit Fyers Greeks
