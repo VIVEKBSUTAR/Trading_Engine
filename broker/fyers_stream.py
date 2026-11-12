@@ -18,7 +18,7 @@ import json
 import math
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from threading import Event, Thread
 from typing import Any
 
@@ -89,6 +89,7 @@ class FyersStream:
         if not access_token:
             raise FyersAuthError("Fyers access token is required for streaming")
 
+        self._clock_offset: timedelta | None = None
         self._normalizer = normalizer or FyersTickNormalizer()
         self._token_to_symbol: dict[int, str] = {}
         self._symbol_to_token: dict[str, int] = {}
@@ -239,6 +240,7 @@ class FyersStream:
             subscriptions=len(self._state.subscribed_symbols),
         )
 
+        self._clock_offset = None
         if threaded:
             self._thread = Thread(target=self._run_socket, daemon=True, name="FyersDataSocketThread")
             self._thread.start()
@@ -270,6 +272,7 @@ class FyersStream:
         return self._state.connected
 
     def _on_connect(self) -> None:
+        self._clock_offset = None
         self._state.connected = True
         self._state.safe_mode = bool(self._security_guard.safe_mode) if self._security_guard is not None else False
         self._connected_event.set()
@@ -307,6 +310,7 @@ class FyersStream:
             stage = "extract"
             ticks: list[Mapping[str, Any]] = []
             index_symbols: set[str] = set()
+            exchange_timestamps: list[pd.Timestamp | None] = []
             for packet in packets:
                 if not isinstance(packet, Mapping):
                     raise _InvalidStreamPacketError("Tick is not an object")
@@ -342,10 +346,12 @@ class FyersStream:
                 else:
                     # Fyers index packets legitimately have no bid, ask or volume.
                     index_symbols.add(symbol)
+                stamp = None
                 if packet.get("exch_feed_time") is not None:
                     stamp = FyersTickNormalizer._normalize_timestamp(packet["exch_feed_time"])
                     if stamp is None or pd.isna(stamp):
                         raise _InvalidStreamPacketError("Invalid exchange feed timestamp")
+                exchange_timestamps.append(stamp)
                 ticks.append(packet)
 
             for handler in self._raw_tick_handlers:
@@ -382,14 +388,33 @@ class FyersStream:
                 extracted.append((int(token), bid, ask, price, row["timestamp"].to_pydatetime(warn=False)))
 
             stage = "integrity"
+            local_now = datetime.now(UTC)
+            offset = self._clock_offset
+            exchange_times = [stamp for stamp in exchange_timestamps if stamp is not None]
+            if offset is None and exchange_times:
+                # Commit calibration only after every integrity check succeeds.
+                offset = local_now - max(exchange_times).to_pydatetime(warn=False)
+            normalized_now = local_now - (offset or timedelta())
+            validation_frame = frame.copy()
+            # Missing exchange time uses local receipt time; it must not establish
+            # calibration or be compared as though it were on the exchange clock.
+            receipt_rows = [stamp is None for stamp in exchange_timestamps]
+            validation_frame.loc[receipt_rows, "timestamp"] -= offset or timedelta()
             if self._security_guard is not None:
-                # Exchange/local clock skew is tolerated only at packet ingress.
-                # Accepted drift stays silent; packets older than 60s still reject.
-                self._security_guard.validate_stream_frame(frame, packet_only=True, max_stale_seconds=60)
+                self._security_guard.validate_stream_frame(
+                    validation_frame, packet_only=True, max_stale_seconds=2,
+                    reference_time=normalized_now,
+                )
                 health = self._security_guard.health_snapshot()
                 self._state.duplicate_ticks = health.duplicate_ticks
                 self._state.out_of_order_ticks = health.out_of_order_ticks
                 self._state.safe_mode = self._security_guard.safe_mode
+            else:
+                normalized_age = (pd.Timestamp(normalized_now) - validation_frame["timestamp"].min()).total_seconds()
+                if normalized_age > 2:
+                    raise _InvalidStreamPacketError(f"Stale websocket frame: normalized age={normalized_age:.3f}s")
+            if self._clock_offset is None and exchange_times:
+                self._clock_offset = offset
 
             stage = "aggregate"
             if self._aggregator is not None:

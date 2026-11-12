@@ -494,3 +494,42 @@ continuity. Changed-file Ruff passes (existing SIM103 is excluded). This verifie
 packet admission, not live exchange synchronization. Trade marks still require
 <=2-second-old quotes; actual clock skew can therefore freeze downstream
 valuation even when ingress accepts the packet. Live observation remains pending.
+
+## Dynamic exchange-clock calibration — 2026-11-12
+
+The Fyers data pipeline architecture is unchanged; the ingress clock policy now
+supersedes the prior 60-second allowance. Initialize `_clock_offset` to None in
+the stream and reset it at explicit connect and every connection callback. A
+candidate offset is local UTC time minus the latest exchange feed timestamp in
+the first valid market packet. Commit it only after all integrity checks succeed,
+preventing malformed/duplicate/out-of-order packets from poisoning calibration.
+
+Subtract the stored offset from local UTC before evaluating every packet. The
+shared guard accepts an optional reference time and enforces a strict two-second
+maximum age across every row. Its other callers retain their configured policies.
+The parser also enforces this age check when no optional guard is attached.
+Accepted packets remain quiet; stale packets warn and return, never closing the
+socket or latching packet errors into global safe mode. The existing future-time
+check is evaluated on the normalized clock too.
+
+Only exchange feed time can establish the offset. Receipt-time fallback packets
+cannot masquerade as exchange time or prevent later calibration. For mixed
+packets, adjust receipt-only rows on a validation copy so both sources can be
+compared with the normalized reference clock. Preserve the original timestamps
+sent to aggregation, storage, and consumers. Last-trade time is not a calibration
+source. The offset is fixed until reconnect rather than continually relearned
+from potentially delayed packets.
+
+The requested first-sample estimator necessarily absorbs the first packet's
+network delay and cannot independently establish clock accuracy. Subsequent
+local clock jumps require reconnect. Downstream raw-time quote freshness checks
+are unchanged, so normalized ingress alone does not guarantee active valuation
+under hardware skew. No order execution or new data source is introduced.
+
+Validation: the full isolated Python 3.12 suite passes 195 tests plus 5 subtests;
+changed-file Ruff passes excluding existing SIM103. Deterministic tests cover
+positive/negative/zero offsets, 2.000-second acceptance and 2.001-second rejection,
+fixed offsets as local time advances, invalid first packets, mixed batches,
+receipt-time fallback, guard-less operation, reconnect resets, unchanged emitted
+exchange timestamps, stale rejection, and subsequent recovery. Networking was
+disabled. Live deployment/calibration observation remains pending.

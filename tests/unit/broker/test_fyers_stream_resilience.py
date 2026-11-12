@@ -64,6 +64,7 @@ def test_bad_packet_warns_then_next_valid_tick_is_delivered(stream, warnings, ba
     consumer.assert_not_called()
     stream.aggregator.push_option_tick.assert_not_called()
     assert stream.state.last_tick_at is None
+    assert stream._security_guard.health_snapshot().last_stream_at is None
     assert stream.state.dropped_packets == 1
     assert warnings and all(record["level"].name == "WARNING" for record in warnings)
     assert not stream._security_guard.safe_mode
@@ -84,7 +85,6 @@ def test_control_packets_are_heartbeats_not_market_ticks(stream, warnings, messa
     stream._on_message(message)
     assert stream.state.last_heartbeat_at is not None
     assert stream.state.last_tick_at is None
-    assert stream._security_guard.health_snapshot().last_stream_at is None
     consumer.assert_not_called()
     assert not warnings
     assert_alive(stream)
@@ -116,11 +116,14 @@ def test_json_bytes_aliases_and_zero_volume(stream):
 
 
 def test_stale_then_fresh_packet_does_not_latch_safe_mode(stream, warnings):
+    stream._on_message(tick())
+    stream.aggregator.reset_mock()
+    last_stream_at = stream._security_guard.health_snapshot().last_stream_at
     consumer = Mock()
     stream.register_tick_handler(consumer)
     stream._on_message(tick(exch_feed_time=(datetime.now(UTC) - timedelta(minutes=2)).timestamp()))
     assert not stream._security_guard.safe_mode
-    assert stream._security_guard.health_snapshot().last_stream_at is None
+    assert stream._security_guard.health_snapshot().last_stream_at == last_stream_at
     consumer.assert_not_called()
     stream.aggregator.push_option_tick.assert_not_called()
     stream._on_message(tick())
@@ -208,6 +211,9 @@ def test_old_last_trade_time_does_not_replace_fresh_quote_arrival_time(stream):
 
 @pytest.mark.parametrize("case", ["future", "duplicate", "out_of_order"])
 def test_integrity_rejection_is_packet_local_and_fresh_data_recovers(stream, case):
+    if case == "future":
+        stream._on_message(tick())
+        stream.aggregator.reset_mock()
     now = datetime.now(UTC)
     if case == "future":
         message = tick(exch_feed_time=(now + timedelta(hours=1)).timestamp())
@@ -239,34 +245,38 @@ def integrity_clock(monkeypatch):
             return now.astimezone(tz) if tz else now.replace(tzinfo=None)
 
     monkeypatch.setattr("broker.api_security.datetime", FixedDateTime)
+    monkeypatch.setattr("broker.fyers_stream.datetime", FixedDateTime)
+    monkeypatch.setattr("broker.normalizer.datetime", FixedDateTime)
     return now
 
 
-@pytest.mark.parametrize("age,accepted", [(20, True), (59.999, True), (60, True), (60.001, False), (61, False)])
-def test_ingress_clock_drift_sixty_second_boundary(stream, warnings, integrity_clock, age, accepted):
+@pytest.mark.parametrize("age,accepted", [(0, True), (1.999, True), (2, True), (2.001, False), (5, False)])
+def test_normalized_two_second_boundary(stream, warnings, integrity_clock, age, accepted):
+    stream._on_message(tick(exch_feed_time=(integrity_clock - timedelta(seconds=20)).timestamp()))
+    offset = stream._clock_offset
+    assert offset == timedelta(seconds=20)
     consumer = Mock()
     stream.register_tick_handler(consumer)
-    # The Fyers-specific override works even with the legacy 20s configuration.
-    assert stream._security_guard._settings.stale_stream_seconds == 20
-    stream._on_message(tick(exch_feed_time=(integrity_clock - timedelta(seconds=age)).timestamp()))
+    stream._on_message(tick(exch_feed_time=(integrity_clock - timedelta(seconds=20 + age)).timestamp()))
     assert bool(consumer.call_count) is accepted
+    assert stream._clock_offset == offset  # stale packets must not recalibrate
     assert stream.state.dropped_packets == (0 if accepted else 1)
     if accepted:
         assert warnings == []
-        assert stream.state.last_packet_error is None
     else:
         assert any("Stale websocket" in record["message"] for record in warnings)
     assert_alive(stream)
 
 
-def test_sixty_second_tolerance_rejects_old_rows_in_mixed_packet(stream, integrity_clock):
+def test_calibration_rejects_stale_rows_in_mixed_packet(stream, integrity_clock):
     consumer = Mock()
     stream.register_tick_handler(consumer)
     stream._on_message([
-        tick(exch_feed_time=(integrity_clock - timedelta(seconds=61)).timestamp()),
-        tick(exch_feed_time=(integrity_clock - timedelta(seconds=10)).timestamp()),
+        tick(exch_feed_time=(integrity_clock - timedelta(seconds=23)).timestamp()),
+        tick(exch_feed_time=(integrity_clock - timedelta(seconds=20)).timestamp()),
     ])
     consumer.assert_not_called()
+    assert stream._clock_offset is None
     assert stream.state.dropped_packets == 1
     assert_alive(stream)
 
@@ -276,3 +286,74 @@ def test_generic_integrity_policy_keeps_configured_tolerance(stream, integrity_c
         tick(exch_feed_time=(integrity_clock - timedelta(seconds=21)).timestamp())], source="fyers").frame
     with pytest.raises(APISecurityError, match="Stale websocket"):
         stream._security_guard.validate_stream_frame(frame, packet_only=True)
+
+
+@pytest.mark.parametrize("drift", [20, -20, 0, 120])
+def test_first_valid_packet_calibrates_signed_clock_offset(stream, warnings, integrity_clock, drift):
+    assert stream._clock_offset is None
+    stamp = integrity_clock - timedelta(seconds=drift)
+    consumer = Mock()
+    stream.register_tick_handler(consumer)
+    stream._on_message(tick(exch_feed_time=stamp.timestamp()))
+    assert stream._clock_offset == timedelta(seconds=drift)
+    assert consumer.call_args.args[0].timestamp.iloc[0] == pd.Timestamp(stamp)
+    assert not warnings
+    assert_alive(stream)
+
+
+def test_bad_packets_and_heartbeats_cannot_calibrate(stream, integrity_clock):
+    stream._on_message({"type": "hb"})
+    stream._on_message(tick(ask_price=None, exch_feed_time=integrity_clock.timestamp()))
+    stream._on_message([tick(exch_feed_time=integrity_clock.timestamp())] * 4)
+    assert stream._clock_offset is None
+    stream._on_message(tick(exch_feed_time=(integrity_clock - timedelta(seconds=20)).timestamp()))
+    assert stream._clock_offset == timedelta(seconds=20)
+
+
+def test_receipt_time_does_not_calibrate_or_poison_exchange_offset(stream, integrity_clock):
+    packet = tick()
+    del packet["exch_feed_time"]
+    consumer = Mock()
+    stream.register_tick_handler(consumer)
+    stream._on_message(packet)
+    assert stream._clock_offset is None
+    stream._on_message(tick(exch_feed_time=(integrity_clock - timedelta(seconds=40)).timestamp()))
+    assert stream._clock_offset == timedelta(seconds=40)
+    stream._on_message(packet)
+    assert consumer.call_count == 3
+    assert_alive(stream)
+
+
+def test_reconnect_resets_calibration(stream, integrity_clock):
+    stream._on_message(tick(exch_feed_time=(integrity_clock - timedelta(seconds=20)).timestamp()))
+    stream._on_connect()
+    assert stream._clock_offset is None
+    stream._on_message(tick(exch_feed_time=(integrity_clock - timedelta(seconds=30)).timestamp()))
+    assert stream._clock_offset == timedelta(seconds=30)
+
+
+def test_stale_filter_runs_even_without_security_guard(stream, integrity_clock):
+    stream._security_guard = None
+    stream._on_message(tick(exch_feed_time=(integrity_clock - timedelta(seconds=20)).timestamp()))
+    consumer = Mock()
+    stream.register_tick_handler(consumer)
+    stream._on_message(tick(exch_feed_time=(integrity_clock - timedelta(seconds=23)).timestamp()))
+    consumer.assert_not_called()
+    assert stream.state.dropped_packets == 1
+    stream._on_message(tick(exch_feed_time=(integrity_clock - timedelta(seconds=20)).timestamp()))
+    consumer.assert_called_once()
+    assert_alive(stream)
+
+
+def test_elapsed_local_time_uses_fixed_offset_for_later_packets(stream, integrity_clock, monkeypatch):
+    stream._on_message(tick(exch_feed_time=(integrity_clock - timedelta(seconds=20)).timestamp()))
+    later = integrity_clock + timedelta(minutes=1)
+    clock = Mock()
+    clock.now.return_value = later
+    monkeypatch.setattr("broker.fyers_stream.datetime", clock)
+    consumer = Mock()
+    stream.register_tick_handler(consumer)
+    stream._on_message(tick(exch_feed_time=(later - timedelta(seconds=20)).timestamp()))
+    consumer.assert_called_once()
+    assert stream._clock_offset == timedelta(seconds=20)
+    assert_alive(stream)

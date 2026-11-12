@@ -309,18 +309,31 @@ This presentation change passed all 35 dashboard tests and changed-file lint;
 live deployment/market validation is still pending. Rebuild the Docker services
 to activate the updated dashboard and publication fields.
 
-## Fyers packet clock tolerance
+## Fyers dynamic stream-clock calibration
 
-Fyers websocket ingress accepts exchange timestamps up to **60 seconds old**
-without warning logs, including exactly 60 seconds. Any older row rejects its
-packet with a warning; the socket keeps listening. `_on_message` passes this
-explicit tolerance to the integrity guard, so an existing generic
-`TE_STALE_STREAM_SECONDS=20` does not override it. Other timestamp-integrity
-checks remain active.
+Each connection starts with `_clock_offset = None`. The first structurally and
+integrity-valid exchange-timestamped market packet establishes
+`offset = local_UTC_now − exchange_packet_time`. Every subsequent packet is
+checked against `normalized_now = local_UTC_now − offset`. All rows must have a
+normalized age <=**2 seconds**; older packets log a warning and return without
+closing the socket. The fixed 60-second Fyers allowance is removed. Generic
+integrity callers keep their configured clock and tolerance.
 
-This only changes packet admission. Stored exchange times, dashboard clocks,
-and the monitor's two-second quote-freshness requirement are unchanged. A real
-20-second hardware skew can still freeze analytical valuation; accepting packets
-does not prove live execution readiness. Rebuild the services to activate the
-change. Offline validation: 62 broker tests and 5 subtests pass; changed-file lint
-passes. Live observation of the reported drift remains pending.
+The offset remains fixed for that connection and resets on start/reconnect.
+Heartbeats, malformed packets, duplicate/order rejection, and invalid timestamps
+do not calibrate it. Packets without exchange timestamps retain receipt-time
+validation and leave calibration pending; last-trade time is never a clock
+reference. Mixed packets normalize receipt-only rows on a validation copy.
+Original exchange timestamps delivered to consumers and storage are preserved.
+
+The first sample establishes a baseline, so its initial network delay is absorbed
+into the estimate; this is not independent verification of the exchange clock.
+Subsequent time jumps require reconnect/recalibration. This phase changes parser
+admission only: downstream quote valuation still applies its existing raw-time
+freshness checks and can freeze under hardware skew.
+
+Validation: **195 full-suite tests and 5 subtests pass** in isolated Python 3.12
+with networking disabled, including signed/zero offsets, strict age boundaries,
+stale-batch rejection, reconnect reset, missing timestamps, and socket continuity.
+Changed-file lint passes. Rebuild/deploy the services and observe real Fyers data
+to validate the new policy live; no deployment was performed in this phase.

@@ -198,7 +198,7 @@ class APISecurityGuard:
                 f"(market may be closed or instrument not available)"
             )
 
-    def validate_stream_frame(self, frame: pd.DataFrame, *, packet_only: bool = False, max_stale_seconds: float | None = None) -> list[str]:
+    def validate_stream_frame(self, frame: pd.DataFrame, *, packet_only: bool = False, max_stale_seconds: float | None = None, reference_time: datetime | None = None) -> list[str]:
         """Reject invalid data; Fyers packet errors do not latch global safe mode."""
         def reject(reason: str) -> NoReturn:
             if not packet_only:
@@ -239,7 +239,7 @@ class APISecurityGuard:
             self.mark_safe_mode("Duplicate tick threshold exceeded")
 
         latest_tick = ts.max().to_pydatetime(warn=False)
-        now = datetime.now(UTC)
+        now = reference_time if reference_time is not None else datetime.now(UTC)
         # A caller-specific ingress tolerance must cover every row in the packet.
         oldest_tick = ts.min().to_pydatetime(warn=False) if max_stale_seconds is not None else latest_tick
         stale_age = (now - oldest_tick.astimezone(UTC)).total_seconds()

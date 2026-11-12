@@ -2,7 +2,30 @@
 
 Last updated: 2026-11-12 (Asia/Kolkata).
 
-## Current phase: Fyers packet clock tolerance — 2026-11-12
+## Current phase: dynamic Fyers clock calibration — 2026-11-12
+
+Built: per-connection `_clock_offset = None`; first valid exchange-timestamped
+packet establishes local-minus-exchange offset; normalized local time is used
+for strict two-second packet integrity. Ages >2 seconds warn and drop without
+closing the socket. The earlier 60-second ingress allowance is superseded.
+Offsets reset at start/reconnect, remain fixed between connections, and cannot
+be set by malformed packets or heartbeats. Receipt-only packets do not calibrate;
+mixed frames use a validation copy. Consumer exchange timestamps are preserved.
+The same two-second check applies when no security guard is attached.
+
+Validation: **195 full-suite tests passed plus 5 subtests** in isolated Python
+3.12 with networking disabled; changed-file Ruff passes excluding existing
+SIM103. Coverage includes signed/zero offsets, exact two-second boundaries,
+malformed first packets, stale rows in batches, receipt-time fallback, elapsed
+local time, reconnect, guard-less validation, and stale-then-fresh recovery.
+
+Pending: rebuild/deploy the containers and observe calibration against live Fyers
+packets; live-fire lifecycle deployment and real-time AWS EC2/VPS observation
+remain pending. The first packet's network delay becomes part of the baseline,
+and downstream raw-time quote freshness is unchanged, so packet admission alone
+does not establish live valuation readiness. No broker orders/fills are added.
+
+## Previous phase: Fyers packet clock tolerance — 2026-11-12
 
 Built: `_on_message` explicitly applies a 60-second stale-age tolerance through
 the shared integrity guard. Ages <=60 seconds are accepted without warnings;
