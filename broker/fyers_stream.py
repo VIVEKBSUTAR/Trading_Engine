@@ -383,7 +383,9 @@ class FyersStream:
 
             stage = "integrity"
             if self._security_guard is not None:
-                self._security_guard.validate_stream_frame(frame, packet_only=True)
+                # Exchange/local clock skew is tolerated only at packet ingress.
+                # Accepted drift stays silent; packets older than 60s still reject.
+                self._security_guard.validate_stream_frame(frame, packet_only=True, max_stale_seconds=60)
                 health = self._security_guard.health_snapshot()
                 self._state.duplicate_ticks = health.duplicate_ticks
                 self._state.out_of_order_ticks = health.out_of_order_ticks

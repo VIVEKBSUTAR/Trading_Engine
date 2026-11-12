@@ -198,7 +198,7 @@ class APISecurityGuard:
                 f"(market may be closed or instrument not available)"
             )
 
-    def validate_stream_frame(self, frame: pd.DataFrame, *, packet_only: bool = False) -> list[str]:
+    def validate_stream_frame(self, frame: pd.DataFrame, *, packet_only: bool = False, max_stale_seconds: float | None = None) -> list[str]:
         """Reject invalid data; Fyers packet errors do not latch global safe mode."""
         def reject(reason: str) -> NoReturn:
             if not packet_only:
@@ -239,11 +239,15 @@ class APISecurityGuard:
             self.mark_safe_mode("Duplicate tick threshold exceeded")
 
         latest_tick = ts.max().to_pydatetime(warn=False)
-        stale_age = (datetime.now(UTC) - latest_tick.astimezone(UTC)).total_seconds()
-        if stale_age > self._settings.stale_stream_seconds:
+        now = datetime.now(UTC)
+        # A caller-specific ingress tolerance must cover every row in the packet.
+        oldest_tick = ts.min().to_pydatetime(warn=False) if max_stale_seconds is not None else latest_tick
+        stale_age = (now - oldest_tick.astimezone(UTC)).total_seconds()
+        tolerance = self._settings.stale_stream_seconds if max_stale_seconds is None else max_stale_seconds
+        if stale_age > tolerance:
             self._stale_stream_count += 1
             reject(f"Stale websocket frame: {stale_age:.1f}s old")
-        if stale_age < -self._settings.max_payload_age_seconds:
+        if (now - latest_tick.astimezone(UTC)).total_seconds() < -self._settings.max_payload_age_seconds:
             self._stale_stream_count += 1
             reject("Websocket frame timestamp is in the future")
         self._last_stream_at = latest_tick

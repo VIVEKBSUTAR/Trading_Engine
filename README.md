@@ -308,3 +308,19 @@ show `—` for unavailable position times until the updated engine publishes the
 This presentation change passed all 35 dashboard tests and changed-file lint;
 live deployment/market validation is still pending. Rebuild the Docker services
 to activate the updated dashboard and publication fields.
+
+## Fyers packet clock tolerance
+
+Fyers websocket ingress accepts exchange timestamps up to **60 seconds old**
+without warning logs, including exactly 60 seconds. Any older row rejects its
+packet with a warning; the socket keeps listening. `_on_message` passes this
+explicit tolerance to the integrity guard, so an existing generic
+`TE_STALE_STREAM_SECONDS=20` does not override it. Other timestamp-integrity
+checks remain active.
+
+This only changes packet admission. Stored exchange times, dashboard clocks,
+and the monitor's two-second quote-freshness requirement are unchanged. A real
+20-second hardware skew can still freeze analytical valuation; accepting packets
+does not prove live execution readiness. Rebuild the services to activate the
+change. Offline validation: 62 broker tests and 5 subtests pass; changed-file lint
+passes. Live observation of the reported drift remains pending.

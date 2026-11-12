@@ -471,3 +471,26 @@ disabled; changed-file Ruff passes. Tests cover mixed naive/aware timestamps,
 UTC/IST offsets, noon/midnight/day rollover, missing/invalid values, audit/rejection
 rendering, active positions, telemetry, alerts, chart hover, and unchanged UTC
 freshness calculations. No live deployment or market-readiness claim is made.
+
+## Fyers ingress clock-drift tolerance — 2026-11-12
+
+Architecture is unchanged: `_on_message` continues to delegate integrity checks
+to `APISecurityGuard`. It now passes an explicit 60-second stale-age tolerance
+for Fyers packet ingress, independently of the generic `TE_STALE_STREAM_SECONDS`
+setting. This avoids requiring edits to local credentials/configuration and
+prevents relaxing unrelated REST or valuation policies. The shared guard accepts
+an optional caller-specific tolerance; other callers keep their configured limit.
+
+Accept ages <=60 seconds silently. Reject any row older than 60 seconds in a
+Fyers packet, so a fresh row cannot hide an obsolete one in a batch. Rejected
+packets still produce a warning and return without closing the socket or
+latching safe mode. Existing malformed-data, future-time, duplicate, and ordering
+checks remain. Exchange timestamps are not rewritten or falsely marked fresh.
+
+Validation: 62 broker tests and 5 subtests pass in isolated Python 3.12 with
+networking disabled, including ages 20, 59.999, 60, 60.001, and 61 seconds,
+silent acceptance, stale batch rejection, unchanged generic tolerance, and socket
+continuity. Changed-file Ruff passes (existing SIM103 is excluded). This verifies
+packet admission, not live exchange synchronization. Trade marks still require
+<=2-second-old quotes; actual clock skew can therefore freeze downstream
+valuation even when ingress accepts the packet. Live observation remains pending.

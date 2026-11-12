@@ -2,7 +2,27 @@
 
 Last updated: 2026-11-12 (Asia/Kolkata).
 
-## Current phase: dashboard IST timestamps — 2026-11-12
+## Current phase: Fyers packet clock tolerance — 2026-11-12
+
+Built: `_on_message` explicitly applies a 60-second stale-age tolerance through
+the shared integrity guard. Ages <=60 seconds are accepted without warnings;
+any row older than 60 seconds rejects its packet without closing the connection
+or latching global safe mode. Generic callers retain their configured tolerance;
+other integrity checks and original exchange timestamps are preserved.
+
+Validation: **62 broker tests passed plus 5 subtests**, with a deterministic
+clock testing 20/59.999/60-second acceptance, 60.001/61-second rejection, no
+accepted-drift warnings, old rows in mixed batches, unchanged generic policies,
+and socket continuity. Python 3.12 tests ran with networking disabled. Changed-file
+Ruff passes excluding existing SIM103.
+
+Pending: rebuild/deploy the services and observe real packets under the reported
+clock skew. The separate two-second trade-quote freshness check remains strict,
+so this admission change alone cannot establish fresh valuation or live readiness.
+Live-fire lifecycle deployment and real-time AWS EC2/VPS observation remain
+pending. No broker orders or fills are introduced.
+
+## Previous phase: dashboard IST timestamps — 2026-11-12
 
 Built: one shared pandas UTC-to-Asia/Kolkata display formatter; exact seconds in
 a dated twelve-hour AM/PM clock ending in IST; converted signal audit/rejection
