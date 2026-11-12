@@ -13,6 +13,7 @@ def publication():
     now = datetime.now(UTC)
     return {"timestamp": now.isoformat(), "spot_price": 24500, "vix_value": 14,
         "websocket": {"connected": True, "last_tick_at": now.isoformat(), "safe_mode": False},
+        "lifecycle_alerts": [{"event_id": "entry-1", "alert_type": "ENTRY_BUY", "premium": 101, "timestamp": now.isoformat(), "action": "buy_ce", "strike": 24500}],
         "live_signals": [{"signal_id": "live-ce", "timestamp": now.isoformat(), "action": "buy_ce",
             "strike": 24500, "entry_price": 101, "filter_passed": True}],
         "signals": [{"timestamp": now.isoformat(), "action": "no_trade", "strike": 24500,
@@ -77,3 +78,17 @@ def test_execution_local_database_fallback_shows_no_invented_health(monkeypatch,
     result = shared.load_terminal_data()
     assert result["waiting"]
     assert not result.get("websocket")
+
+
+def test_execution_desk_displays_all_exit_reasons_and_live_context(monkeypatch, tmp_path):
+    monkeypatch.setenv("TE_DASHBOARD_SNAPSHOT_DIR", str(tmp_path))
+    payload = publication()
+    reasons = ["EXIT_STOP_LOSS", "EXIT_TIME_DECAY", "EXIT_VOLATILITY_CRUSH", "EXIT_TAKE_PROFIT", "EXIT_PCR_DROP"]
+    payload["lifecycle_alerts"] = [{"event_id": reason, "alert_type": reason, "timestamp": payload["timestamp"],
+        "action": "buy_ce", "strike": 24500, "premium": 99} for reason in reasons]
+    payload["positions"][0].update(live_iv=18.5, time_in_trade=12.5)
+    (tmp_path / "latest.json").write_text(json.dumps(payload))
+    app = AppTest.from_file(str(DESK)).run(timeout=10)
+    assert not app.exception
+    assert all(any(reason in alert.value for alert in app.error) for reason in reasons)
+    assert {"Live Premium", "Trailing Stop", "Time in Trade", "Live IV"}.issubset(app.dataframe[0].value.columns)

@@ -2,13 +2,53 @@
 
 Last updated: 2026-11-12 (Asia/Kolkata).
 
-## Completed implementation
+## Current phase: Greeks and lifecycle upgrade — 2026-11-12
+
+Built: signed Delta-near-0.70 strike selection; strict Trap <0.5, aggregate PCR
+>1.5, IV percentile <50 gates; 20-snapshot IV warm-up; explicit Fyers Greeks
+requests/normalization; zero-carry Black–Scholes Delta fallback when IV exists;
+index-only 14-period completed-minute ATR; Delta-adjusted initial/ratcheting
+premium stops; consistent premium risk sizing; separate persisted `ENTRY_BUY`
+and five requested exit alerts, plus retained DTE `EXIT_TIME_LIMIT`.
+
+Built: 15-second Fyers snapshot refresh during streaming; serialized evaluations;
+45-second IV/positioning context limits; fresh real entry quotes; preservation of
+websocket timestamps/marks; Max Pain/PCR from deduplicated same-expiry rows;
+Execution Desk Live Premium, bold Trailing Stop, Time in Trade, Live IV columns,
+exact reason banners/toasts, and exit priority. Candidate signal logs remain
+separate from actual analytical entry events. The 20% PCR fall default and Max
+Pain touch/crossing rule were explicitly accepted by the user.
+
+Validation: **167 tests passed and 5 subtests passed**, in an isolated Python 3.12
+container with networking disabled and no credentials/runtime data mounted.
+Coverage includes known Delta values/signs, missing Greeks, strict entry gates,
+index ATR warm-up/gaps, stop non-widening, every exit route and precedence,
+idempotent DuckDB events/outcomes, stale-context stop protection, and Streamlit
+labels/columns. Changed-file Ruff passes excluding pre-existing SIM105 in the
+DuckDB close method. This evidence is offline, not proof of live readiness.
+
+Pending: **Live-fire deployment and real-time AWS EC2/VPS observation.** This
+release has not restarted the existing local Docker services. Deploy from the
+canonical checkout using `docker compose up --build -d`, then observe real IV,
+Delta, PCR, index ATR warm-up, entries/exits, timing, and dashboard delivery.
+Active analytical positions and IV observations restart empty; durable state
+recovery, longer IV history/calibration, contract lot-size verification, and
+pre-existing Parquet durability work remain pending.
+
+Execution impact: alerts and positions are analytical only. The new gates reduce
+admission and require warm-up; missing data suppresses new entries. Fresh quotes
+can close at the retained protective stop while missing/stale Greeks suppress
+only dependent exit checks. The 15-minute expiry-day cap preempts the 20-minute
+decay heuristic. Max Pain/PCR reflect returned strikes; time/price decline is not
+causal evidence of Theta loss. No broker orders, fills, or account PnL are claimed.
+
+## Earlier completed implementation (superseded math noted above)
 
 | Area | Exactly what was built | Impact on live market analysis/execution |
 | --- | --- | --- |
 | Fyers integration | Active auth/REST/option-chain/websocket adapters, bid/ask normalization, symbol/token routing; daemon now starts symbol/discovered subscriptions; SDK shutdown uses close_connection | Supplies analytical market data; actual account/feed behavior still needs live observation |
 | Premium valuation | Option ask entry, bid marking/exit, token-specific lifecycle and analytical P&L | Removes index spot as the P&L proxy; recorded outcomes do not establish broker fills |
-| Spread/IV filters | Default 5% spread cap and rolling 90th percentile IV rejection | Screens liquidity and volatility when the required inputs exist; prior missing-data/IV warm-up bypasses remain |
+| Spread/IV filters | Default 5% spread cap, strict IV percentile <50, 20 distinct observations required | Missing quotes/IV/history suppress admission |
 | DuckDB/Parquet | Decision/rejection/outcome tables and per-token archival flush above 5,000 rows | Provides analytical audit/replay data; pre-existing durability gaps remain below |
 | Headless authentication | requests SSO login, current pyotp TOTP, encoded PIN, redirect URI/state validation, SHA-256 auth-code exchange, fail-closed redacted errors | Removes browser steps from container startup; provider SSO is undocumented and not live-validated |
 | Credential/config support | FYERS_USER_ID, FYERS_PIN, FYERS_TOTP_SECRET fields, .env example, and strict validation for headless mode | Headless startup refuses missing credentials; research and token-only probes stay usable |
@@ -17,8 +57,8 @@ Last updated: 2026-11-12 (Asia/Kolkata).
 | Entrypoint | Authenticates, verifies a fresh generated token, then execs te-intelligence | Authentication failure prevents stale-token startup; no login restart storm or daily scheduler is introduced |
 | Independent dashboard | Engine atomically publishes latest.json; dashboard reads it with timed fragments, publication age, signals, positions, and recent outcomes | Avoids DuckDB multi-process locking and duplicate broker runtimes; dashboard receives no account credentials |
 | DTE/theta limits | Snapshot-local calendar DTE; 15-minute expiry-day cap, 45-minute later-expiry cap embedded in SignalResult; missing/expired expiry rejection | Limits analytical exposure to time decay; fresh quotes are still required to value an exit |
-| OI imbalance | CE/PE open interest for the exact selected strike/expiry; PE/CE ratio; BUY_CE rejection below 0.8, BUY_PE rejection above 1.2; missing/invalid OI rejection | Filters opposing strike exposure without combining contracts from different expiries |
-| ATR stops/trailing | Fourteen completed contiguous one-minute midpoint bars; mean true range with gaps; stop at ask minus 1.5 ATR; trailing begins at 1R and follows bid minus 1 ATR without widening; premium target at ask plus 3 ATR | Replaces percentage/index-scaled monitor stops with premium volatility; new positions wait for valid history |
+| Positioning | Deduplicated same-expiry aggregate PCR >1.5; live Max Pain/PCR exit context | Supersedes old directional strike thresholds; returned-strike proxy only |
+| ATR stops/trailing | Fourteen completed index-minute true ranges; initial/trailing distance = NIFTY ATR × absolute Delta; stop never widens | No percentage stop, fixed target, or activation delay; entry waits for valid history |
 | Shared tick state | Runtime/stream/engine/monitor use one aggregator; ATR reads retained raw stream history across archival flushes | Ensures monitor mathematics sees streamed ticks rather than a separate snapshot-only buffer |
 | Schema migration | Additive DuckDB signals columns max_holding_minutes, days_to_expiry, strike_oi_ratio and parameterized insert support | Preserves existing records and records new holding/OI diagnostics |
 | Documentation | Permanent AGENTS.md protocol, decision.md architectural reasoning, live README, and this status ledger | Every completed phase updates all three required documents |
@@ -31,7 +71,7 @@ history instead of relying on expired contracts or missing ATR bypasses.
 
 ## Validation evidence
 
-- Full repository suite: **107 tests passed**, plus **5 unittest subtests**,
+- Full repository suite: **149 tests passed**, plus **5 unittest subtests**,
   including two-page navigation/hierarchy, live alert windows/deduplication,
   position styling, Plotly area behavior, and exact-expiry/market-date checks.
   Command: `PYTHONPATH=src:. python -m pytest tests -q`.
@@ -47,7 +87,7 @@ history instead of relying on expired contracts or missing ATR bypasses.
 - Dashboard checks render both waiting-for-engine and published snapshot states
   without credentials or a DuckDB connection.
 - Tests used an isolated temporary Python 3.14 environment with installed test
-  dependencies. Python 3.12 container execution has not been verified here.
+  dependencies. Python 3.12.16 container execution is now verified by the live startup below.
 - Existing warnings concern SDK pkg_resources deprecation, research config field
   naming, timestamp inference, and sparse-feature means; they are not test failures.
 
@@ -61,9 +101,10 @@ real option ticks, bid/ask freshness, OI/DTE rejections, ATR warm-up/stops/trail
 DuckDB migration/writes, dashboard publication age, and SIGTERM cleanup. Record
 timestamps, symbols, counts, and exit statuses without credentials.
 
-Docker is unavailable on this host. No real Fyers SSO request, token exchange,
-market websocket run, EC2/VPS deployment, or broker order was performed. Offline
-completion does not establish live readiness.
+The local Docker stack now runs with successful daily authentication and real
+Fyers websocket updates; see the live startup record below. EC2/VPS deployment,
+longer strategy/lifecycle observation, the standalone fifty-tick probe, and broker
+fill validation remain unperformed. Analytical positions are not broker orders.
 
 ## Remaining operational work and limitations
 
@@ -82,8 +123,8 @@ completion does not establish live readiness.
   replace repeated part filenames, and is not invoked for remaining rows at
   runtime shutdown. Durable replay still needs these earlier hardening items.
 - Verify lot-size and risk-sizing assumptions, quote/IV availability and bypasses,
-  supplementary NSE chain behavior, and callback-triggered shutdown under real
-  SDK traffic. The runtime still combines REST/NSE enrichment with websocket data.
+  and callback-triggered shutdown under real SDK traffic. Live market data now
+  comes exclusively from Fyers REST/websocket; public NSE enrichment is removed.
 - Dashboard performance is based on at most the most recent 1,000 outcomes;
   local database mode remains available without claiming live health or positions.
 - The existing checkout .git file points to an invalid repository location, so
@@ -174,3 +215,138 @@ ATR test clocks and a regression test for historical read-copy refresh. Producti
 session/ATR logic is unchanged. Source/configuration/tests/documentation are
 maintained in the canonical laptop checkout and published to GitHub main; live
 account validation and live-fire EC2/VPS observation remain pending.
+
+
+## Local environment and headless auth verification — 2026-11-12
+
+Updated the canonical root .env with the user-supplied TOTP secret and placeholder
+FYERS_USER_ID/FYERS_PIN values, preserving other configuration and 0600 permissions.
+Credentials were not copied to the chat workspace or recorded in documentation.
+Verified .env is explicitly listed in .gitignore, ignored by Git, and untracked.
+Auth source reads FYERS_TOTP_SECRET and uses pyotp.TOTP(totp_secret).now() directly
+for the SSO OTP payload. Local generation produces six numeric digits; neither
+the code nor the secret was displayed or transmitted. Five offline auth tests pass.
+
+Executed docker compose config in /Volumes/APFS/projects/trading_engine: exit 0;
+all three required environment values interpolate correctly. Rendered output was
+captured and suppressed. This supersedes the earlier missing-Docker tooling
+blocker for configuration validation. No container startup, SSO login, or live
+websocket connection was attempted. Replace the placeholder user ID and PIN before
+account authentication. Live-fire deployment and real-time AWS EC2/VPS observation
+remain pending. Source and all three protocol documents are synchronized locally.
+
+
+## Account placeholders replaced — 2026-11-12
+
+The user supplied account ID/PIN; both placeholders were replaced only in the
+canonical local .env. Docker Compose configuration/interpolation passes again.
+Verified .env remains ignored, untracked, and mode 0600. This supersedes the
+earlier pending placeholder replacement. No account values appear in tracked
+files, and no SSO request, container startup, or live-feed test was performed.
+Live authentication and market validation remain pending.
+
+
+## Unified Fyers data pipeline — completed 2026-11-12
+
+Removed every live runtime scraper import/instance and the NSE HTTP enrichment
+block. refresh_once now uses the existing FyersMarketClient snapshot and routes
+its normalized option_instruments DataFrame directly into MarketStateAggregator.
+Deleted ingestion/nse_fetcher.py and its unused legacy scheduler to leave no
+dangling imports. Removed the public NSE endpoint/bootstrap/header configuration.
+Historical parsing remains offline; generic API ingestion blocks public NSE hosts
+and redirects before making requests. Added a permanent Fyers-only source policy
+to AGENTS.md and updated README deployment/source descriptions.
+
+Validation: **114 tests and 5 subtests passed**; changed-code Ruff checks pass.
+Runtime regression verifies exactly one Fyers snapshot fetch, unchanged chain
+routing, no auxiliary HTTP request, and absence of the scraper/parser/validator
+instances. Additional checks verify deleted modules stay unavailable and generic
+ingestion cannot request or redirect to the public NSE website.
+
+Live-market impact: the public-website 404/bootstrap/retry path is removed from
+analytical refreshes. All live spot, VIX, option premiums/OI, and ticks now originate
+in Fyers. Data quality, availability, and freshness still require broker/live-feed
+observation. Source/config/tests/docs are synchronized to the canonical laptop
+root; running containers must be rebuilt to receive the fix. No live SSO call,
+container restart, or market validation was performed for this source change.
+Next pending task remains Live-fire deployment and real-time AWS EC2/VPS observation.
+
+
+## Local project started with real Fyers data — 2026-11-12 10:01 IST
+
+Executed docker desktop start, then docker compose up --build -d engine dashboard
+from /Volumes/APFS/projects/trading_engine. Both images built and both containers
+started successfully. Dashboard container is healthy, engine remains running, and
+http://localhost:8501/_stcore/health returns HTTP 200 with body ok. Opened the real
+Execution Desk in the browser and confirmed its connected websocket status.
+
+Observed daily token generation success, websocket_connected true, safe_mode false,
+publication age 0.34 seconds and last-tick age 0.37 seconds. Live NIFTY/VIX values
+were present; the inspected signal was no_trade and there were no active analytical
+positions. Engine Python is 3.12.16. Confirmed the deleted NSE scraper is absent
+from the running image. Inspected startup logs contained no fatal engine error or
+legacy scraper error. All log inspection suppressed local credential values.
+
+This supersedes earlier missing-Docker/unperformed-startup entries for the local
+machine. Services are intentionally left running. No code architecture changed
+and no additional unit tests were needed for this operational phase; the previous
+114-test result remains the offline baseline. Long-duration live observation, the
+standalone fifty-tick probe, ATR/filter/exit behavior, persistence durability, and
+AWS EC2/VPS deployment remain pending. No broker orders or fills are claimed.
+
+
+## Fault-tolerant websocket parser — implementation verified 2026-11-12
+
+Rewrote _on_message with a broad callback exception boundary. Invalid messages
+WARN and return without calling stop/close or escaping into the SDK. Validate
+all rows before publishing to state; isolate raw/tick consumer exceptions. Accept
+native complete option fields and aliases including zero volume; preserve valid
+index messages without option-only fields. Heartbeat/control packets never become
+market ticks. Added dropped-packet count and last-error diagnostics on stream.state.
+
+Removed synthetic bid/ask fallback, fixed numeric-string exchange epochs and
+zero volume, and stopped treating old last-trade time as current quote time.
+Fyers stream validation now rejects individual stale/future/duplicate/out-of-order
+packets without latching packet-induced global safe mode. Independent safe mode
+is retained and data freshness/frozen-position rules are unchanged.
+
+Validation: **149 tests and 5 subtests passed**, including 35 new parser/recovery
+cases, inside a network-disabled Python 3.12 container with no credentials/live
+data mounted. Changed-file lint passes with pre-existing unrelated SIM103 excluded.
+Verified that every tested failed packet warns, produces no invalid state/callback
+update, leaves the transport open, and permits the next valid packet. Deployment
+and short live observation are recorded below; offline tests are not a guarantee
+of long-duration market stability.
+
+
+## Parser fix deployed and observed — 2026-11-12 10:27 IST
+
+Rebuilt and restarted the engine service with the tested parser; dashboard remained
+healthy. Confirmed the actual running image contains the broad Exception handler,
+no stop/close call in _on_message, and the packet_only validation API. During the
+short live check: one packet WARNING, zero Stream integrity validation failed
+messages, zero Fyers DataSocket closed events, and no fatal engine error.
+Websocket_connected was true, safe_mode false, publication age 1.95 seconds and
+published last-tick age 1.99 seconds. Dashboard HTTP health returned 200.
+
+Services are left running. All required documents and source/tests are synchronized
+to the canonical local checkout. The 149-test/5-subtest result is the isolated
+regression evidence; this short live window additionally verifies active packet
+processing without observed parser-driven disconnect. Longer traffic/strategy/
+lifecycle observation and AWS EC2/VPS validation remain pending. No credentials
+or raw live packets were added to tracked files.
+
+## Git publication phase — 2026-11-12
+
+Prepared all pending source/configuration/test/documentation changes for a single
+canonical-checkout commit: unified Fyers data, scraper removal, resilient stream
+parsing, Greeks/lifecycle alerts, and dashboard updates. Added explicit ignore
+rules for runtime dashboard publication and local environment variants, retaining
+`.env.example`. Existing local changes are included; credentials and runtime
+artifacts are excluded. Architecture is unchanged by publication.
+
+Validation: canonical/workspace files match, 167 offline tests plus 5 subtests
+passed for the combined implementation, changed-file lint passed, and Git's
+whitespace check is clean. Source publication does not deploy the running Docker
+services. Live-fire lifecycle deployment and real-time AWS EC2/VPS observation
+remain pending; no broker orders or fills are implied.

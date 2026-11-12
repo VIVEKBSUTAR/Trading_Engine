@@ -251,6 +251,7 @@ class StrikeResult:
     moneyness: str
     strike_distance: float | None = None
     expected_move: float | None = None
+    delta: float | None = None
     selection_grade: TradeGrade = TradeGrade.B
     rationale: list[str] = field(default_factory=list)
 
@@ -384,6 +385,9 @@ class SignalResult:
     days_to_expiry: int | None = None
     max_holding_minutes: int | None = None
     strike_oi_ratio: float | None = None
+    entry_iv: float | None = None
+    entry_pcr: float | None = None
+    underlying_atr: float | None = None
 
     def signal_age_seconds(self) -> float:
         """Seconds elapsed since signal was generated (uses expires_at as anchor)."""
@@ -422,6 +426,13 @@ class OpenTrade:
     initial_risk: float | None = None
     stop_loss_price: float | None = None
     trailing_active: bool = False
+    delta: float | None = None
+    entry_iv: float | None = None
+    live_iv: float | None = None
+    entry_pcr: float | None = None
+    last_high_at: datetime | None = None
+    high_premium: float = 0.0
+    previous_spot: float | None = None
 
 
 @dataclass(slots=True)
@@ -433,6 +444,7 @@ class TradeUpdate:
     expired_trades: list[OpenTrade]
     total_pnl: float
     alert_messages: list[str] = field(default_factory=list)
+    lifecycle_alerts: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass(slots=True)

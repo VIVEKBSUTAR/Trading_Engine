@@ -326,11 +326,13 @@ class TestStep5RuntimeAndMain:
             option_instruments=mock_chain,
         )
 
-        with patch("broker.fyers_client.FyersMarketClient.get_live_snapshot", return_value=snapshot), \
-             patch("ingestion.nse_fetcher.NSEOptionChainFetcher.fetch_option_chain") as mock_fetch:
-            mock_fetch.side_effect = RuntimeError("Mock fetch disable")
+        with patch("broker.fyers_client.FyersMarketClient.get_live_snapshot", return_value=snapshot) as fetch_snapshot, \
+             patch("requests.sessions.Session.request", side_effect=AssertionError("Unexpected HTTP request")) as http:
             runtime = LiveIntelligenceRuntime(app_settings)
             assert isinstance(runtime.stream, FyersStream)
+            assert not hasattr(runtime, "_fetcher")
+            assert not hasattr(runtime, "_parser")
+            assert not hasattr(runtime, "_validator")
 
             report = runtime.refresh_once()
             assert report is not None
@@ -338,3 +340,12 @@ class TestStep5RuntimeAndMain:
             # Check aggregator's snapshot bundle has the spot price
             bundle = runtime._aggregator.build_snapshot()
             assert bundle.spot_price == 24500.0
+            pd.testing.assert_frame_equal(bundle.option_chain_frame, mock_chain)
+            fetch_snapshot.assert_called_once_with()
+            http.assert_not_called()
+
+
+def test_public_scraper_modules_are_absent():
+    import importlib.util
+    assert importlib.util.find_spec("ingestion.nse_fetcher") is None
+    assert importlib.util.find_spec("ingestion.scheduler") is None

@@ -194,7 +194,7 @@ def test_step3_state_aggregator_flushes_buffer_exceeding_5000_rows(tmp_path: Pat
     assert len(df_read) == 5001
 
 
-def test_step4_live_intelligence_engine_persists_accepted_and_rejected_signals(tmp_path: Path, current_option_chain):
+def test_step4_live_intelligence_engine_persists_accepted_and_rejected_signals(tmp_path: Path, current_option_chain, option_history):
     """Step 4: LiveIntelligenceEngine writes evaluated setups to DuckDB signals table."""
     db_file = tmp_path / "test_signals.duckdb"
     duckdb_mgr = DuckDBManager(db_file)
@@ -225,11 +225,16 @@ def test_step4_live_intelligence_engine_persists_accepted_and_rejected_signals(t
     ])
 
     opt_chain_accepted = current_option_chain(opt_chain_accepted, now)
+    opt_chain_accepted["timestamp"] = now
+    key = (opt_chain_accepted.expiry.iloc[0], 24000., "CE")
+    engine._signal_engine._historical_iv[key] = [.3] * 20
+    underlying = option_history(now).rename(columns={"bid_price": "last_price"})
+    underlying["last_price"] += 23900
     snapshot_accepted = MarketSnapshotBundle(
         timestamp=now,
         spot_price=24000.0,
         vix_value=13.0,
-        spot_frame=pd.DataFrame([{"timestamp": now, "close": 24000.0}]),
+        spot_frame=underlying,
         vix_frame=pd.DataFrame([{"timestamp": now, "close": 13.0}]),
         option_chain_frame=opt_chain_accepted,
         ticks_frame=pd.DataFrame([{"timestamp": now, "instrument_token": 88001, "last_price": 100.5}]),
@@ -309,8 +314,8 @@ def test_step5_monitor_persists_trade_outcomes_and_uses_65_multiplier(tmp_path: 
         entry_reference=100.0,
         stop_loss=90.0,
         target=130.0,
-        strike=StrikeResult(OptionSide.CE, 24500.0, "2026-10-22", "ATM"),
-        quantity=2,
+        strike=StrikeResult(OptionSide.CE, 24500.0, "2026-10-22", "ATM", delta=.7),
+        quantity=2, underlying_atr=10., entry_iv=20., entry_pcr=1.6,
         signal_id="SIG-TEST-65",
     )
 
@@ -358,7 +363,7 @@ def test_step5_monitor_persists_trade_outcomes_and_uses_65_multiplier(tmp_path: 
     assert closed["entry_ask_price"] == 100.0
     assert closed["exit_bid_price"] == 88.0
     assert closed["quantity"] == 2
-    assert closed["exit_reason"] == "stop_loss"
+    assert closed["exit_reason"] == "EXIT_STOP_LOSS"
     # PnL: (88.0 - 100.0) * 65 * 2 = -1560.0
     assert closed["realized_pnl"] == pytest.approx(-1560.0)
 

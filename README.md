@@ -5,18 +5,29 @@ Streamlit terminal for NIFTY option alerts and position monitoring. Signals,
 risk plans, positions, and PnL are analytical outputs; they do not establish
 broker orders or fills.
 
+## Current local runtime
+
+The Greeks/lifecycle upgrade is implemented and tested in source. The previously
+observed Docker deployment used the earlier parser release; this phase has not
+restarted the running services or validated the new lifecycle rules against live
+markets. Rebuild with `docker compose up --build -d` from the canonical checkout
+when deploying this release. Analytical positions and IV warm-up history are
+in memory and restart empty; historical decisions, alerts, and outcomes remain
+in DuckDB. AWS/VPS observation remains pending.
+
 ## Two-page terminal
 
 **Execution Desk** is the default page (`1_Execution_Desk.py`). Its visual order is:
 
 1. One compact row: Fyers WebSocket status, NIFTY spot, and India VIX.
-2. A fresh passed BUY_CE/BUY_PE alert with action, strike, and option entry premium.
-3. Active positions with green profit/red loss and bold trailing-stop values.
+2. Fresh `ENTRY_BUY` and exact `EXIT_*` lifecycle alerts with direction, strike, and premium.
+3. Active positions with Live Premium, bold Trailing Stop, Time in Trade, Live IV, and green/red analytical PnL.
 
 Equity charts, performance metrics, and historical logs do not appear on this
-page. New alerts toast once per signal ID in a browser session; the current alert
-remains visible only within its 60-second window. When a batch arrives, the newest
-qualifying signal is highlighted and older members of that batch are marked seen.
+page. Lifecycle alerts toast once per event ID in a browser session and appear
+for 60 seconds, with exits ahead of entries. An `ENTRY_BUY` event means an
+analytical position actually opened after risk and data checks; a passed
+BUY_CE/BUY_PE candidate in the audit log alone does not produce an entry toast.
 Stale publications suppress live alerts and mark cached positions as stale.
 
 **Analytics & Logs** (`pages/2_Analytics_And_Logs.py`) contains Total Profit,
@@ -97,13 +108,13 @@ PYTHONPATH=src:. te-intelligence
 PYTHONPATH=src:. python -m pytest tests -q
 ```
 
-Offline verification: **108 tests and 5 subtests pass**. Changed-code lint and the
-non-editable wheel build pass; both page scripts are present in the wheel. Browser
-review used synthetic fixtures. Docker and live-account validation remain pending;
-see `project_status.md` for exact operational status. The requested
-`docker compose up --build` attempt exited 127 (`docker: command not found`).
-The Docker launcher symlink points to an absent Docker Desktop binary. The
-terminal is **not live**; restore/install Docker Desktop, then rerun the command.
+Offline verification: **149 tests and 5 subtests pass**. Changed-code lint and the
+non-editable wheel build pass; both page scripts are present in the wheel. The saved UI preview images use synthetic fixtures. The actual local Docker stack
+has now also been started and checked against live Fyers data. Docker Compose
+configuration passes, daily token generation succeeded, and the dashboard returned
+HTTP 200. The authentication payload uses `pyotp.TOTP(totp_secret).now()`; secrets
+remain in ignored local `.env`, not in source or documentation. See
+`project_status.md` for observed evidence and pending validation.
 
 ## Isolated live websocket validation
 
@@ -124,26 +135,62 @@ signal accuracy or fills.
 
 - Index spot supplies direction/strike context. Long-option valuation enters at
   ask and marks/exits at bid for the selected token.
-- Spread rejection defaults to `(ask - bid) / bid > 0.05`; IV rejection uses the
-  rolling 90th percentile. Prior missing-quote/IV and warm-up bypasses remain.
-- DTE uses the snapshot's Asia/Kolkata date and selected contract expiry. Expiry
-  day carries a 15-minute holding cap; later days carry 45 minutes. Invalid,
-  missing, or expired contracts fail closed.
-- The same-strike/same-expiry PE/CE OI ratio rejects BUY_CE below 0.8 and BUY_PE
-  above 1.2. Missing or invalid OI fails closed.
-- ATR uses 14 completed contiguous one-minute midpoint bars with true-range gaps.
-  Initial stop is ask minus 1.5 ATR; at 1R profit trailing follows bid minus one
-  ATR without widening. The premium target is ask plus 3 ATR. Insufficient ATR
-  history suppresses admission. Signal TTL and holding lifetime are separate.
-- Runtime, engine, and monitor share tick history. Stops/time limits require fresh
-  option updates; missing/stale data freezes valuation and cannot establish an
-  executable exit. A stale terminal never claims a healthy websocket.
-- DuckDB stores decisions and analytical outcomes. Raw ticks flush to Parquet
-  above 5,000 rows per token. Existing failed-writer buffer clearing, reused part
-  filenames, shutdown flushing, and lot-size/sizing assumptions need hardening.
+- Entries select the closest signed Delta to +0.70 (CE) or -0.70 (PE), within
+  an absolute-Delta band of 0.60–0.80. Missing eligible strikes suppress entry.
+  Fyers requests include `greeks="1"`; nested or flat Delta/IV are supported.
+  IV uses provider percentage units (20 means 20%). If Delta alone is missing,
+  a European Black–Scholes estimate uses supplied IV, expiry at 15:30 IST, and
+  zero interest/dividend carry. This approximation is not a promise of lower Theta.
+- Entry gates are Trap Score <0.5, same-expiry aggregate Put OI / Call OI >1.5,
+  and IV percentile strictly below 50, alongside existing probability, quality,
+  spread, and risk checks. The old directional strike OI thresholds are superseded.
+  PCR and Max Pain use the returned chain's strikes, not unobserved market-wide OI.
+- Spread rejection defaults to `(ask - bid) / bid >0.05`. IV percentile is the
+  fraction of up to 100 same-contract observations <= current IV; at least 20
+  distinct timestamped chain snapshots are required. All returned contracts are
+  observed independently of entry gates; repeated socket evaluations do not add
+  observations. Missing quotes, IV, PCR, Delta, or ATR suppress entry.
+- NIFTY ATR is the mean of 14 completed contiguous one-minute true ranges,
+  including close gaps and a preceding bar, built exclusively from index LTP
+  history. The forming minute, prior sessions, and option prices are excluded.
+  Initial stop = entry ask − NIFTY ATR × |Delta|. Each fresh evaluation ratchets
+  stop = max(previous stop, current bid − live NIFTY ATR × |live Delta|).
+  There is no percentage stop, fixed premium target, or 1R activation delay.
+- Exit precedence: `EXIT_STOP_LOSS`; `EXIT_VOLATILITY_CRUSH` (IV falls >10%
+  relative to entry IV); `EXIT_TIME_DECAY` (>20 minutes since the last new
+  premium high and bid >2% below entry ask); `EXIT_TAKE_PROFIT` (fresh NIFTY
+  touches/crosses live Max Pain); `EXIT_PCR_DROP` (PCR falls at least 20% from
+  entry PCR); then `EXIT_TIME_LIMIT`. One exit closes each analytical position.
+  Time decay is a price/time heuristic, not causal Theta attribution. The Max
+  Pain reason does not guarantee positive PnL.
+- DTE retains the 15-minute expiry-day and 45-minute later-expiry caps, measured
+  independently of signal admission TTL. The 15-minute cap can preempt the
+  20-minute decay rule on expiry day.
+- Fyers snapshots refresh every 15 seconds during streaming. Evaluation is
+  serialized; REST fetching happens outside the evaluation lock. IV/PCR/Delta
+  context older than 45 seconds cannot trigger related exits or adjust stops.
+  Fresh bids can still trigger an existing stop; missing Greeks never erase it.
+  Missing quotes, >2-second-old bids, or future timestamps freeze evaluation.
+  Entries require a real <=2-second quote and <=45-second contract context.
+  Max Pain crossing requires fresh index data. Old REST quotes retain their
+  original timestamps and cannot overwrite newer websocket marks.
+- `TE_PCR_DROP_FRACTION=0.20` configures the relative PCR exit drop (0–1,
+  exclusive). `TE_MAX_IMPLIED_VOLATILITY_PERCENTILE` defaults to 0.50;
+  larger legacy values cannot relax the strict 50th-percentile gate.
+- Runtime sizing now uses premium stop distance and the same assumed 65-unit
+  NIFTY lot multiplier as analytical PnL. Verify the current contract specification
+  before interpreting size or PnL; no orders are submitted.
+- DuckDB stores candidate decisions, `lifecycle_alerts` (parameterized,
+  idempotent event IDs), and analytical outcomes with exact exit reasons. The
+  engine publishes these events to both terminal pages without a second broker
+  runtime. Raw option ticks still flush to Parquet above 5,000 rows per token;
+  pre-existing writer-failure, file-reuse, and shutdown-flush limitations remain.
 
 Historical research, backtesting, and model utilities remain available. The full
-runtime combines Fyers websocket/REST with supplementary NSE option-chain data.
+live runtime uses Fyers websocket/REST exclusively for spot, VIX, and option-chain
+data. Direct public NSE scraping and its scheduler have been removed permanently.
+Generic API ingestion also blocks public NSE hosts and redirects to them; saved
+legacy snapshots may still be parsed offline.
 The Fyers 3.2.1 SDK pins requests 2.31.0; the project range accommodates it.
 Plotly was already declared and remains required; Streamlit now requires at least
 1.51 for the terminal's table font-weight support.
@@ -177,3 +224,71 @@ The combined local/root changes pass 108 tests and 5 subtests. ATR lifecycle tes
 use a deterministic intraday clock so running the suite around midnight in India
 does not mistake the expected session warm-up for a regression. The canonical
 checkout retains local broker/storage fixes alongside this chat's upgrades.
+
+
+## Fyers-only runtime fix — 2026-11-12
+
+`refresh_once()` calls the existing FyersMarketClient for a snapshot and passes
+`snapshot.option_instruments` directly into MarketStateAggregator alongside
+spot/VIX. There is no NSE HTTP enrichment, cookie bootstrap, or website fallback.
+The scraper module and its unused scheduler were deleted; public NSE URL/header
+settings were removed. Network-denial regression tests cover generic ingestion
+and redirects, while runtime tests assert the exact Fyers chain reaches state.
+
+This fix is synchronized to the canonical laptop checkout. Existing Docker
+containers must be rebuilt to load the changed source:
+
+```bash
+docker compose up --build -d engine dashboard
+```
+
+The offline suite passes 114 tests and 5 subtests. Live Docker/Fyers execution
+was not rerun as part of this source fix.
+
+
+## Fault-tolerant websocket packets — 2026-11-12
+
+The entire Fyers message callback now catches Exception. Malformed/incomplete
+option packets and normalization/integrity failures log a redacted WARNING and
+return immediately; they never call stop/close or escape into the SDK manager.
+Validation precedes all state publication. Bid/ask/volume aliases and zero volume
+are supported; missing bid/ask is never synthesized from LTP. Native index
+messages are accepted without option-only fields, and control acknowledgements
+update heartbeat health without creating market ticks.
+
+Stale/future/duplicate/out-of-order packets are rejected locally, allowing the
+next valid packet through without latching global safe mode. Independent security
+safe mode and freshness/frozen-position protections remain intact. Exchange epoch
+strings are parsed correctly; old last-trade time is not treated as quote time.
+Consumer exceptions are isolated. Packet drop/error counters are on stream.state.
+
+All 149 tests and 5 subtests pass in an isolated Python 3.12 validation container
+with networking disabled and no account credentials or live data mounted. Thirty-
+five new cases prove packet rejection/recovery and that no socket-close/stop call
+occurs. Production rebuild/observation is recorded in project_status.md.
+
+Schemas: [Fyers symbol updates](https://fyers.in/api-docs/v3/api/websockets/data-socket/data-socket-symbol-update/)
+and [index updates](https://fyers.in/api-docs/v3/api/websockets/data-socket/data-socket-indices-update/).
+
+Parser fix deployed locally at 2026-11-12 10:27 IST: engine rebuilt/restarted, dashboard
+kept running. The inspected live interval recorded one skipped-packet warning,
+zero socket-close events and no fatal parser/engine error, with connected fresh
+Fyers data and safe_mode false. [The terminal](http://localhost:8501) remains
+available. Long-duration feed/lifecycle observation remains pending.
+
+## Lifecycle upgrade validation — 2026-11-12
+
+The isolated Python 3.12 regression suite passes 167 tests plus 5 subtests.
+Coverage includes reference Delta values, strict entry boundaries, complete-bar
+index ATR, stop ratcheting, each exit route, event/outcome persistence, stale or
+missing context, and exact dashboard labels. These are offline tests with
+networking disabled and no account credentials mounted. Live lifecycle behavior
+and AWS EC2/VPS observation remain unverified for this release.
+
+## Source publication
+
+Project source, tests, deployment configuration, and the three phase documents
+are committed from the canonical laptop checkout. Credentials (`.env` and its
+local variants), generated dashboard JSON, market data, and logs are excluded;
+`.env.example` remains a safe configuration template. A Git push publishes code;
+use the documented Docker rebuild separately to activate a release.

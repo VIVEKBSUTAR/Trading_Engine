@@ -257,3 +257,194 @@ to an intraday instant. Production session boundaries and ATR warm-up rules are
 unchanged. The temporary-copy historical reader also has a refresh regression
 test. Original local edits are preserved in the combined tree and a local backup
 Git reference. Publication targets main through a normal fast-forward push.
+
+## Local headless environment validation — 2026-11-12
+
+No architectural change. Populate only the canonical checkout's ignored local
+.env with the requested TOTP secret and placeholder account ID/PIN; do not mirror
+the credential file into the chat workspace. Keep restrictive file permissions
+and preserve unrelated settings. The authentication script loads FYERS_TOTP_SECRET
+from environment/.env, checks the TOTP time boundary, then calls exactly
+pyotp.TOTP(totp_secret).now() for the OTP payload. Local six-digit generation and
+five offline authentication tests pass without contacting Fyers. Docker Compose
+configuration validation now succeeds; capture/suppress its rendered environment
+because ordinary config output includes secrets. Placeholder account ID/PIN satisfy
+interpolation but do not establish login readiness or live-market connectivity.
+
+## Local account configuration completion — 2026-11-12
+
+No architectural change. Replace the account ID/PIN placeholders only in the
+canonical ignored .env, retain 0600 permissions, and validate Compose without
+printing its rendered credentials. The values are not copied into source,
+documentation, Git, or the chat workspace. Compose validation passes; this
+configuration check does not contact SSO or establish account/login readiness.
+
+## Permanent removal of public NSE scraping — 2026-11-12
+
+The production error path was a second option-chain fetch inside refresh_once:
+NSEOptionChainFetcher attempted public NSE HTTP scraping even though FyersMarketClient
+already supplied normalized options in its snapshot. Remove that dependency,
+constructor state, parser/validator enrichment pass, and its HTTP error/fallback
+handling. Route snapshot.option_instruments directly through update_from_snapshot's
+option_chain argument so spot/VIX and option premiums/OI share the Fyers source.
+No additional option-chain REST request or website fallback is introduced.
+
+Delete ingestion/nse_fetcher.py and the unused legacy ingestion/scheduler.py, which
+otherwise retains an import of the removed scraper. Remove public NSE endpoint,
+cookie-bootstrap, and browser-header defaults from runtime settings. Retain offline
+parsers for previously saved data. Generic historical API ingestion rejects public
+NSE hosts before opening a connection and in the redirect handler, preventing a
+configured URL from restoring the removed path. This uses urllib's supported
+[HTTP redirect hook](https://docs.python.org/3/library/urllib.request.html#urllib.request.HTTPRedirectHandler.redirect_request).
+AGENTS.md now makes the Fyers-only live-source policy permanent.
+
+Validation: 114 tests and 5 subtests pass. Runtime refresh uses one mocked Fyers
+snapshot, preserves its exact option-chain DataFrame, and makes no auxiliary
+HTTP request. The removed scraper and scheduler modules cannot be imported.
+Dedicated regression cases deny public NSE URLs (including subdomains/case/trailing
+dots) and redirects without network access. No live auth/session or container
+restart was performed; rebuild running images to load the fix.
+
+## Local live startup verification — 2026-11-12 10:01 IST
+
+No architectural change. Start Docker Desktop through its CLI, then rebuild and
+launch engine/dashboard from the canonical checkout with docker compose up --build
+-d engine dashboard. Both services run on the existing Fyers-only deployment.
+Headless daily token generation succeeded, the dashboard health endpoint returned
+HTTP 200, and the Execution Desk visibly showed a connected websocket.
+A real engine publication was 0.34 seconds old and its last Fyers tick was 0.37
+seconds old at inspection, with safe_mode false. Python 3.12.16 is running in the
+engine image and the retired scraper module is absent. Service logs contained no
+legacy scraper error or fatal engine error during the inspected startup interval.
+No credentials were displayed or mirrored. This establishes local startup/feed
+connectivity, not AWS deployment, guaranteed strategy accuracy, or broker fills.
+
+## Fault-tolerant Fyers parser upgrade — 2026-11-12
+
+The old callback wrote option ticks before validating integrity and called stop()
+on a validation error. A single malformed/stale packet could therefore contaminate
+state and close the socket. The rewrite places decoding, extraction, normalization,
+integrity validation, and routing inside a broad try/except Exception. An invalid
+packet logs WARNING and returns without stop/close or an escaping exception.
+Validate every row before aggregator/strategy publication. Isolate raw/tick
+consumer errors so one consumer cannot crash the SDK or block the others.
+
+Recognize dictionaries, JSON strings/bytes, and tick lists. Classify known control
+frames as heartbeats; native sf packets and untyped complete quote dictionaries
+remain market data. Required option fields are finite positive LTP/bid/ask, a
+noncrossed book, nonnegative volume, and a valid token. Zero volume and native or
+shorthand field names are supported. Index if packets legitimately omit bid/ask
+and volume, so they remain valid without adding them to option quote buffers.
+
+Remove fabricated bid/ask from LTP. Preserve zero-valued volume aliases and parse
+numeric-string feed epochs. Feed/receive time describes quote freshness; last
+executed trade time can legitimately be old and is not a substitute. Rejected
+packets never update last_tick_at. Warnings show stage/reason without raw packets
+or arbitrary exception text; stream state records drop count and last error.
+
+Fyers uses APISecurityGuard packet_only validation to reject stale/future/duplicate/
+out-of-order data without permanently latching global safe mode from that packet.
+Independent security safe mode is never cleared and legacy callers retain their
+default policy. Freshness and frozen-position protections still apply. Keeping
+the transport alive does not mean accepting invalid analytical data.
+
+Verification: 149 tests and 5 subtests pass in a network-disabled Python 3.12
+container without credentials/live data. Thirty-five new cases cover malformed
+messages, required fields, control/index packets, aliases/zero volume, timestamp
+forms, consumer/normalizer/validator/aggregator failures, data-integrity rejection,
+valid next-packet recovery, and assertions that no stop/close occurs. Local source
+and documentation are synchronized before deployment observation.
+
+### Deployed parser verification — 2026-11-12 10:27 IST
+
+No additional architectural change during deployment. Rebuilt/restarted only the
+engine with docker compose up --build -d engine, leaving dashboard available.
+Inspected the running callback to confirm broad exception containment and absence
+of stop/close calls, plus the packet_only guard API. At the short live check the
+new container logged one skipped-packet WARNING, zero old fatal integrity messages,
+zero SDK close events, and no fatal engine error. Websocket remained connected
+with safe_mode false; publication age was 1.95 seconds and published tick age 1.99
+seconds. Dashboard health returned HTTP 200. This is bounded local observation,
+not a guarantee of long-duration stability or executable fills.
+
+## Delta/IV/positioning lifecycle architecture — 2026-11-12
+
+This phase changes analytical entry selection, premium risk sizing, lifecycle
+monitoring, event persistence, and the Execution Desk. It supersedes the earlier
+ATM/confidence strike heuristic, 90th-percentile warm-up bypass, directional
+strike OI gates, and option-midpoint ATR / 1R trailing / fixed premium target.
+Fyers remains the exclusive live data source; no order operations are introduced.
+
+Select the nearest eligible |Delta| to 0.70 within 0.60–0.80 using the correct CE
+positive / PE negative sign. Request optional Fyers Greeks with `greeks="1"`
+and retain IV in percentage units. Provider Delta is preferred; a validated
+European Black–Scholes zero-carry approximation is available when only Delta is
+missing. Expiry time is 15:30 IST and the year basis is 365 days. Missing IV is
+never synthesized. Higher Delta reduces relative extrinsic exposure in some
+contracts, but does not itself prove minimal Theta exposure. Mathematical
+reference: [OIC option price behavior](https://www.optionseducation.org/referencelibrary/faq/option-price-behavior).
+Provider contract: [Fyers option-chain documentation](https://fyers.in/api-docs/ai/skills/option-chain/)
+and [Fyers market-data reference](https://github.com/FyersDev/fyers-skills/blob/master/skills/fyers-trading/references/market-data.md).
+
+Entries require Trap Score <0.5, same-expiry aggregate PCR >1.5, and empirical
+IV percentile <50, plus existing quality/probability/spread/risk controls. A PE
+entry is subject to the same requested support gate; the old PE ratio >1.2
+rejection would contradict that gate and is removed. Use at most 100 distinct
+same-contract chain timestamps and require 20 observations. Observe every
+returned contract independently of entry gates to avoid sampling only passed
+candidates. Deduplicate historical chain rows before computing OI or Max Pain.
+This is positioning inferred from the returned strike range, not proof of
+institutional ownership or the entire market's positions.
+
+The monitor uses 14 completed contiguous one-minute index-LTP true ranges plus
+a preceding close. It deliberately avoids mixed option candles and daily OHLC.
+Initial premium risk is NIFTY ATR × |Delta|; the stop ratchets upward from bid
+minus that live distance and can never widen. Entries and sizing use the same
+premium risk, with the monitor's assumed 65-unit lot multiplier. No percentage
+stop, fixed premium target, or profit-activation delay remains in the live path.
+Warm-up and stale data fail closed rather than manufacturing prices.
+
+Exit precedence is stop, IV crush (>10% relative entry-IV fall), decay heuristic
+(>20 minutes without a premium high and >2% below entry ask), Max Pain touch or
+crossing, PCR drop (>=20% relative entry PCR), then retained DTE holding limits.
+The user accepted the 20% PCR default and Max Pain crossing interpretation;
+`TE_PCR_DROP_FRACTION` makes the PCR default configurable. The 15-minute expiry-day
+limit intentionally preempts a 20-minute decay exit. Time/price alone cannot
+attribute losses causally to Theta, and Max Pain exits can close at a loss.
+
+Periodic 15-second Fyers REST refreshes keep IV/OI context current alongside
+socket prices. REST fetches run outside the evaluation lock; state mutation,
+monitoring, persistence, and report publication are serialized. Contract context
+expires after 45 seconds, bids after two seconds, and Max Pain uses fresh index
+observations. Stale REST quotes retain their observation timestamps and cannot
+overwrite newer marks. Existing protective stops survive missing new Greeks.
+
+Candidate direction remains BUY_CE/BUY_PE for compatibility with historical
+analysis. Separate `ENTRY_BUY` and exact `EXIT_*` events describe actual
+analytical lifecycle transitions. Parameterized DuckDB `lifecycle_alerts` inserts
+use unique event IDs, preserving exits beyond the monitor's current report.
+The dashboard prioritizes exits, deduplicates toasts, and shows live bid premium,
+bold stop, elapsed minutes, and IV. Neither events nor outcomes imply broker fills.
+
+Validation: 167 offline Python 3.12 tests and 5 subtests pass, including numerical
+Delta references, strict boundaries, underlying ATR, all exit routes, idempotent
+persistence, and Streamlit rendering. Changed-file Ruff checks pass (the existing
+DuckDB close-method SIM105 warning is excluded). Networking was disabled and no
+credentials were mounted. New lifecycle deployment/observation, model calibration,
+restart recovery for active analytical positions, and durable IV history remain
+pending. This phase does not restart the previously running Docker services.
+
+## Git publication and runtime exclusions — 2026-11-12
+
+Architecture is unchanged in this publication phase. The pending Fyers-only
+pipeline removal, resilient packet parser, Greeks/lifecycle mathematics, tests,
+configuration, and documentation are grouped into one reviewed Git change from
+the canonical laptop checkout. Runtime dashboard JSON is excluded alongside
+credentials, logs, and market data. Environment variants are ignored while
+`.env.example` remains versioned. Publishing source does not rebuild containers,
+recover in-memory analytical positions, or validate live market behavior.
+
+Validation evidence remains 167 passing Python 3.12 tests plus 5 subtests,
+changed-file lint, and a clean whitespace check. Canonical and workspace source
+files match. Remote publication is verified against the pushed commit; live-fire
+lifecycle deployment and AWS EC2/VPS observation remain pending.

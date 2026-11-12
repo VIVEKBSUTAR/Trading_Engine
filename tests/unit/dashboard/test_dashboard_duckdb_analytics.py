@@ -106,8 +106,8 @@ def _make_dummy_signal(stop_loss: float = 120.0) -> SignalResult:
         entry_reference=150.0,
         stop_loss=stop_loss,
         target=180.0,
-        strike=StrikeResult(OptionSide.CE, 24500.0, "2026-10-22", "ATM"),
-        quantity=2,
+        strike=StrikeResult(OptionSide.CE, 24500.0, "2026-10-22", "ATM", delta=.7),
+        quantity=2, underlying_atr=10., entry_iv=20., entry_pcr=1.6,
         trade_grade=TradeGrade.A_PLUS,
     )
 

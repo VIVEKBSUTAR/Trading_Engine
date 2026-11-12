@@ -13,7 +13,6 @@ from loguru import logger
 
 from storage.duckdb_manager import DuckDBManager
 from trading_engine.intelligence.models import (
-    MarketRegime,
     MarketState,
     OpenTrade,
     SignalAction,
@@ -21,6 +20,7 @@ from trading_engine.intelligence.models import (
     TradeGrade,
     TradeUpdate,
 )
+from trading_engine.intelligence.options_math import number
 
 NIFTY_LOT_SIZE: int = 65
 
@@ -33,6 +33,14 @@ class MonitorConfig:
     trail_distance_pct: float = 0.003
     max_holding_minutes: int = 12
     partial_exit_rr: float = 1.0
+    pcr_drop_fraction: float = 0.20
+    decay_minutes: float = 20.0
+    decay_fraction: float = 0.02
+    iv_drop_fraction: float = 0.10
+
+    def __post_init__(self) -> None:
+        if not 0 < self.pcr_drop_fraction < 1:
+            raise ValueError("PCR drop fraction must be between 0 and 1")
 
 
 class LiveTradeMonitor:
@@ -53,6 +61,9 @@ class LiveTradeMonitor:
         self._expired_trades: list[OpenTrade] = []
         self._alerts: list[str] = []
         self.state_aggregator: Any = None
+        self._events: list[dict[str, Any]] = []
+        self.context: dict[str, Any] = {}
+        self.contract_context: dict[tuple[str, float, str], dict[str, Any]] = {}
 
     @property
     def duckdb_manager(self) -> DuckDBManager | None:
@@ -81,13 +92,15 @@ class LiveTradeMonitor:
         trade_id = f"LT-{next(self._trade_counter):05d}"
         now = datetime.now(UTC)
         ask = float(entry_ask_price if entry_ask_price > 0 else entry_price)
-        if option_ticks is None and self.state_aggregator is not None:
-            option_ticks = self.state_aggregator.get_option_atr_ticks(instrument_token)
-        atr = calculate_option_atr(option_ticks, now=signal_timestamp or now)
-        if atr is None or not math.isfinite(ask) or ask <= 1.5 * atr:
-            raise ValueError("Option ATR unavailable or invalid entry/stop; entry suppressed")
-        signal.stop_loss = ask - 1.5 * atr
-        signal.target = ask + 3.0 * atr
+        delta = number(signal.strike.delta) if signal.strike else None
+        atr = number(signal.underlying_atr)
+        distance = atr * abs(delta) if atr and delta is not None else None
+        if distance is None or not 0 < abs(delta) <= 1 or distance <= 0 or not math.isfinite(ask) or ask <= distance:
+            raise ValueError("NIFTY ATR/Delta unavailable or invalid premium stop; entry suppressed")
+        if not signal.entry_iv or not signal.entry_pcr:
+            raise ValueError("Entry IV/PCR unavailable; entry suppressed")
+        signal.stop_loss = ask - distance
+        signal.target = None
         holding_limit = signal.max_holding_minutes or self._config.max_holding_minutes
         trade = OpenTrade(
             trade_id=trade_id,
@@ -106,11 +119,15 @@ class LiveTradeMonitor:
             entry_ask_price=ask,
             current_bid_price=ask,
             signal_timestamp=signal_timestamp or now,
-            option_atr=atr,
-            initial_risk=1.5 * atr,
+            option_atr=distance,
+            initial_risk=distance,
+            delta=delta, entry_iv=signal.entry_iv, live_iv=signal.entry_iv,
+            entry_pcr=signal.entry_pcr, high_premium=ask, last_high_at=now,
+            previous_spot=number(self.context.get("spot")),
             stop_loss_price=signal.stop_loss,
         )
         self._open_trades[trade_id] = trade
+        self._emit(trade, "ENTRY_BUY", now)
         logger.info(
             "Opened live trade",
             trade_id=trade_id,
@@ -158,10 +175,9 @@ class LiveTradeMonitor:
             return None
 
         sig_ts = signal.state.timestamp if signal.state else datetime.now(UTC)
-        frame = self.state_aggregator.get_option_atr_ticks(token) if self.state_aggregator is not None else None
-        atr = calculate_option_atr(frame, now=sig_ts)
-        if atr is None or not math.isfinite(ask_price) or ask_price <= 1.5 * atr:
-            self._alerts.append(f"Token {token}: option ATR warming up; entry suppressed")
+        distance = signal.underlying_atr * abs(signal.strike.delta) if signal.underlying_atr and signal.strike and signal.strike.delta else None
+        if not distance or ask_price <= distance or not signal.entry_iv or not signal.entry_pcr:
+            self._alerts.append(f"Token {token}: NIFTY ATR/Greeks context warming up; entry suppressed")
             return None
         return self.open_trade(
             signal,
@@ -173,7 +189,7 @@ class LiveTradeMonitor:
             option_type=resolved_type,
             entry_ask_price=ask_price,
             signal_timestamp=sig_ts,
-            option_ticks=frame,
+
         )
 
     def update(
@@ -207,7 +223,7 @@ class LiveTradeMonitor:
             if tick_ts.tzinfo is None:
                 tick_ts = tick_ts.replace(tzinfo=UTC)
             gap_seconds = (now - tick_ts).total_seconds()
-            if gap_seconds > 2.0:
+            if gap_seconds > 2.0 or gap_seconds < -1.0 or not math.isfinite(bid) or bid <= 0:
                 trade.is_frozen = True
                 logger.warning(
                     "Stale option tick data detected; freezing trade evaluation",
@@ -233,22 +249,22 @@ class LiveTradeMonitor:
             pnl_pct = self._pnl_pct(trade)
             trade.peak_pnl = max(trade.peak_pnl, pnl_pct)
 
-            if self.state_aggregator is not None:
-                atr = calculate_option_atr(self.state_aggregator.get_option_atr_ticks(trade.instrument_token), now=now)
-                if atr is not None:
-                    trade.option_atr = atr
-
-            # Trailing stop adjustments
-            if trade.signal.stop_loss is not None and self._should_trail(trade, pnl_pct):
-                trade.signal.stop_loss = self._trail_stop(trade, trade.current_bid_price)
+            context = self.contract_context.get((trade.expiry, trade.strike, trade.option_type), {})
+            context_time = pd.to_datetime(context.get("timestamp"), utc=True, errors="coerce")
+            fresh_context = not pd.isna(context_time) and 0 <= (pd.Timestamp(now) - context_time).total_seconds() <= 45
+            trade.live_iv = number(context.get("iv")) if fresh_context else None
+            delta = number(context.get("delta")) if fresh_context else None
+            if delta is not None and 0 < abs(delta) <= 1:
+                trade.delta = delta
+            atr = number(self.context.get("atr"))
+            if fresh_context and atr and trade.delta and atr > 0:
+                trade.option_atr = atr * abs(trade.delta)
+                trade.signal.stop_loss = max(trade.stop_loss_price or 0, trade.current_bid_price - trade.option_atr)
                 trade.stop_loss_price = trade.signal.stop_loss
-                trade.trailing_active = True
-                self._alerts.append(f"{trade_id}: trailing stop adjusted to {trade.signal.stop_loss:.2f}")
-
-            # Partial exit evaluation
-            if self._should_partial_exit(trade, pnl_pct, latest_state):
-                trade.partial_exit_done = True
-                self._alerts.append(f"{trade_id}: partial exit triggered")
+                trade.trailing_active = trade.stop_loss_price > trade.entry_ask_price - (trade.initial_risk or 0)
+            if trade.current_bid_price > trade.high_premium:
+                trade.high_premium = trade.current_bid_price
+                trade.last_high_at = now
 
             # Exit condition checks (stop loss, time stop, trap exit, regime downgrade)
             if self._should_close(trade, trade.current_bid_price, now, latest_state):
@@ -257,6 +273,7 @@ class LiveTradeMonitor:
                 closed_ids.append(trade_id)
                 self._closed_trades.append(trade)
                 self._alerts.append(f"{trade_id}: closed ({trade.exit_reason}) pnl={pnl_amount:.2f}")
+                self._emit(trade, trade.exit_reason or "EXIT_STOP_LOSS", now)
                 self.record_closed_trade_outcome(trade, exit_timestamp=now)
 
         for trade_id in closed_ids:
@@ -302,6 +319,7 @@ class LiveTradeMonitor:
 
     def summary(self) -> TradeUpdate:
         """Return a snapshot of open/closed trades and PnL."""
+        self._alerts = self._alerts[-200:]
         total_pnl = sum(trade.realized_pnl for trade in self._closed_trades)
         return TradeUpdate(
             open_trades=list(self._open_trades.values()),
@@ -309,6 +327,7 @@ class LiveTradeMonitor:
             expired_trades=list(self._expired_trades),
             total_pnl=float(total_pnl),
             alert_messages=list(self._alerts[-20:]),
+            lifecycle_alerts=list(self._events[-200:]),
         )
 
     @property
@@ -319,27 +338,6 @@ class LiveTradeMonitor:
     def closed_trades(self) -> list[OpenTrade]:
         return list(self._closed_trades)
 
-    def _should_trail(self, trade: OpenTrade, pnl_pct: float) -> bool:
-        return bool(trade.initial_risk and (
-            trade.trailing_active or trade.current_bid_price - trade.entry_ask_price >= trade.initial_risk
-        ))
-
-    def _should_partial_exit(self, trade: OpenTrade, pnl_pct: float, latest_state: MarketState | None) -> bool:
-        if trade.partial_exit_done:
-            return False
-        if pnl_pct < self._config.partial_exit_rr:
-            return False
-        if latest_state is not None and latest_state.trap_probability >= 0.55:
-            return True
-        return pnl_pct >= self._config.partial_exit_rr
-
-    def _trail_stop(self, trade: OpenTrade, current_bid_price: float) -> float:
-        """Trail stop-loss below current bid price for long option position."""
-        trail_level = current_bid_price - trade.option_atr
-        if trade.signal.stop_loss is not None:
-            return float(max(trade.signal.stop_loss, trail_level))
-        return float(trail_level)
-
     def _should_close(
         self,
         trade: OpenTrade,
@@ -347,38 +345,44 @@ class LiveTradeMonitor:
         now: datetime,
         latest_state: MarketState | None,
     ) -> bool:
-        if trade.signal.stop_loss is not None and current_bid_price <= trade.signal.stop_loss:
-            is_trailing = trade.trailing_active
-            trade.exit_reason = "trailing_stop" if is_trailing else "stop_loss"
-            self._alerts.append(f"{trade.trade_id}: {trade.exit_reason} hit at {current_bid_price:.2f}")
-            return True
+        reason = None
+        context = self.contract_context.get((trade.expiry, trade.strike, trade.option_type), {})
+        timestamp = pd.to_datetime(context.get("timestamp"), errors="coerce", utc=True)
+        fresh = not pd.isna(timestamp) and 0 <= (pd.Timestamp(now) - timestamp).total_seconds() <= 45
+        pcr, pain = (number(context.get("pcr")), number(context.get("max_pain"))) if fresh else (None, None)
+        spot = number(self.context.get("spot"))
+        if trade.stop_loss_price is not None and current_bid_price <= trade.stop_loss_price:
+            reason = "EXIT_STOP_LOSS"
+        elif trade.live_iv and trade.entry_iv and trade.live_iv < trade.entry_iv * (1 - self._config.iv_drop_fraction):
+            reason = "EXIT_VOLATILITY_CRUSH"
+        elif ((now - (trade.last_high_at or trade.opened_at)).total_seconds() > self._config.decay_minutes * 60
+              and current_bid_price < trade.entry_ask_price * (1 - self._config.decay_fraction)):
+            # A time/price heuristic, not a causal attribution of loss to Theta.
+            reason = "EXIT_TIME_DECAY"
+        elif (pain is not None and spot is not None and trade.previous_spot is not None
+              and min(spot, trade.previous_spot) <= pain <= max(spot, trade.previous_spot)):
+            reason = "EXIT_TAKE_PROFIT"
+        elif pcr is not None and trade.entry_pcr and pcr <= trade.entry_pcr * (1 - self._config.pcr_drop_fraction):
+            reason = "EXIT_PCR_DROP"
+        elif (now - trade.opened_at).total_seconds() >= (trade.signal.max_holding_minutes or self._config.max_holding_minutes) * 60:
+            reason = "EXIT_TIME_LIMIT"
+        trade.previous_spot = spot
+        trade.exit_reason = reason
+        return reason is not None
 
-        if trade.signal.target is not None and current_bid_price >= trade.signal.target:
-            trade.exit_reason = "target_hit"
-            self._alerts.append(f"{trade.trade_id}: target reached at {current_bid_price:.2f}")
-            return True
-
-        minutes_open = (now - trade.opened_at).total_seconds() / 60.0
-        if minutes_open >= (trade.signal.max_holding_minutes or self._config.max_holding_minutes):
-            trade.exit_reason = "time_stop"
-            self._alerts.append(f"{trade.trade_id}: max holding time reached ({minutes_open:.1f}m)")
-            return True
-
-        if latest_state is not None:
-            if latest_state.trap_probability >= 0.70:
-                trade.exit_reason = "trap_exit"
-                self._alerts.append(f"{trade.trade_id}: trap score exited ({latest_state.trap_probability:.2f})")
-                return True
-            if latest_state.quality_score < 0.35:
-                trade.exit_reason = "quality_exit"
-                self._alerts.append(f"{trade.trade_id}: market quality deteriorated ({latest_state.quality_score:.2f})")
-                return True
-            if latest_state.regime in {MarketRegime.SIDEWAYS_COMPRESSION, MarketRegime.HIGH_NOISE_ENVIRONMENT} and trade.grade != TradeGrade.A_PLUS:
-                trade.exit_reason = "regime_downgrade"
-                self._alerts.append(f"{trade.trade_id}: regime downgraded to {latest_state.regime.value}")
-                return True
-
-        return False
+    def _emit(self, trade: OpenTrade, alert_type: str, now: datetime) -> None:
+        event = {"event_id": f"{trade.trade_id}:{trade.opened_at.isoformat()}:{alert_type}",
+                 "timestamp": now.isoformat(), "alert_type": alert_type, "trade_id": trade.trade_id,
+                 "action": trade.signal.action.value, "strike": trade.strike,
+                 "premium": trade.entry_ask_price if alert_type == "ENTRY_BUY" else trade.current_bid_price}
+        self._events.append(event)
+        self._events = self._events[-200:]
+        self._alerts.append(f"{trade.trade_id}: {alert_type}")
+        if self._duckdb_manager is not None:
+            try:
+                self._duckdb_manager.insert_lifecycle_alert(event)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Lifecycle alert persistence failed: {}", type(exc).__name__)
 
     def _pnl_pct(self, trade: OpenTrade) -> float:
         """Percentage return based on option premium change."""
@@ -440,14 +444,14 @@ def _extract_token_tick(option_ticks: Any, token: int) -> tuple[float | None, fl
             if tick_data.empty:
                 return None, None, None
             row = tick_data.iloc[-1]
-            bid = _safe_float(row.get("bid_price") or row.get("bid") or row.get("last_price"))
-            ask = _safe_float(row.get("ask_price") or row.get("ask") or row.get("last_price"))
+            bid = _safe_float(row.get("bid_price") or row.get("bid"))
+            ask = _safe_float(row.get("ask_price") or row.get("ask"))
             ts = _safe_datetime(row.get("timestamp") or row.get("exchange_timestamp"))
             return bid, ask, ts
 
         if isinstance(tick_data, dict):
-            bid = _safe_float(tick_data.get("bid_price") or tick_data.get("bid") or tick_data.get("last_price"))
-            ask = _safe_float(tick_data.get("ask_price") or tick_data.get("ask") or tick_data.get("last_price"))
+            bid = _safe_float(tick_data.get("bid_price") or tick_data.get("bid"))
+            ask = _safe_float(tick_data.get("ask_price") or tick_data.get("ask"))
             ts = _safe_datetime(tick_data.get("timestamp") or tick_data.get("exchange_timestamp"))
             return bid, ask, ts
 
@@ -465,8 +469,8 @@ def _extract_token_tick(option_ticks: Any, token: int) -> tuple[float | None, fl
             if rows.empty:
                 return None, None, None
             last_row = rows.iloc[-1]
-            bid = _safe_float(last_row.get("bid_price") or last_row.get("bid") or last_row.get("last_price"))
-            ask = _safe_float(last_row.get("ask_price") or last_row.get("ask") or last_row.get("last_price"))
+            bid = _safe_float(last_row.get("bid_price") or last_row.get("bid"))
+            ask = _safe_float(last_row.get("ask_price") or last_row.get("ask"))
             ts = _safe_datetime(last_row.get("timestamp") or last_row.get("exchange_timestamp"))
             return bid, ask, ts
 

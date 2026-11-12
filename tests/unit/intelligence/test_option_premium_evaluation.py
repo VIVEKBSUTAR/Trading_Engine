@@ -66,9 +66,9 @@ def _dummy_signal(
             option_side=OptionSide.CE if action == SignalAction.BUY_CE else OptionSide.PE,
             strike=strike,
             expiry="2026-10-22",
-            moneyness="ATM",
+            moneyness="ATM", delta=.7,
         ),
-        quantity=quantity,
+        quantity=quantity, underlying_atr=10., entry_iv=20., entry_pcr=1.6,
     )
 
 

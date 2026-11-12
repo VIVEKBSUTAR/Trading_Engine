@@ -9,6 +9,8 @@ __pycache__/
 .venv/
 venv/
 .env
+.env.*
+!.env.example
 .DS_Store
 
 # Data and local runtime artifacts
@@ -31,3 +33,6 @@ outputs/
 *.egg-info/
 data/cache/*.txt
 data/cache/**/*.duckdb
+
+# Engine-generated dashboard publication; never source control live positions
+data/dashboard/

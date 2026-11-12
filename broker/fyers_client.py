@@ -187,6 +187,7 @@ class FyersMarketClient:
         data_payload: dict[str, Any] = {
             "symbol": symbol,
             "strikecount": strikecount,
+            "greeks": "1",
         }
         if timestamp is not None:
             data_payload["timestamp"] = int(timestamp)
@@ -268,10 +269,8 @@ class FyersMarketClient:
             bid_price = _safe_float(item.get("bid") or item.get("bid_price") or item.get("bids") or item.get("bp"))
             ask_price = _safe_float(item.get("ask") or item.get("ask_price") or item.get("asks") or item.get("ap"))
 
-            if bid_price is None or bid_price <= 0:
-                bid_price = round(last_price * 0.998, 2) if last_price > 0 else 0.0
-            if ask_price is None or ask_price <= 0:
-                ask_price = round(last_price * 1.002, 2) if last_price > 0 else 0.0
+            bid_price = bid_price or 0.0
+            ask_price = ask_price or 0.0
 
             expiry_raw = item.get("expiry") or item.get("expiry_date") or default_expiry
             expiry_str = _format_expiry(expiry_raw, sym)
@@ -287,7 +286,9 @@ class FyersMarketClient:
                 token_int = int(strike * 10 + side_mult)
 
             oi = _safe_float(item.get("oi") or item.get("open_interest")) or 0.0
-            iv = _safe_float(item.get("iv") or item.get("implied_volatility")) or 0.0
+            greeks = item.get("greeks") if isinstance(item.get("greeks"), dict) else {}
+            iv = _safe_float(item.get("iv") or item.get("implied_volatility") or greeks.get("iv"))
+            delta = _safe_float(item.get("delta") if item.get("delta") is not None else greeks.get("delta"))
 
             record = {
                 "strike": float(strike),
@@ -303,6 +304,8 @@ class FyersMarketClient:
                 "instrument_type": opt_type,
                 "open_interest": oi,
                 "implied_volatility": iv,
+                "delta": delta,
+                "timestamp": datetime.now(UTC),
             }
             records.append(record)
 

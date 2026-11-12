@@ -36,7 +36,7 @@ from trading_engine.intelligence.models import (
 class StateConfig:
     """Limits for in-memory live history buffers."""
 
-    max_spot_rows: int = 2000
+    max_spot_rows: int = 20000
     max_vix_rows: int = 2000
     max_option_rows: int = 20000
     max_tick_rows: int = 50000
@@ -139,6 +139,10 @@ class MarketStateAggregator:
             return
 
         working = batch.frame.copy()
+        if "tradingsymbol" in working and "last_price" in working:
+            index_rows = working.loc[working.tradingsymbol == "NSE:NIFTY50-INDEX", ["timestamp", "last_price"]]
+            if not index_rows.empty:
+                self._spot_history = self._append_and_trim(self._spot_history, index_rows, self._config.max_spot_rows)
         self._ticks = self._append_and_trim(self._ticks, working, self._config.max_tick_rows)
         logger.debug("Updated tick history", rows=len(self._ticks))
 
@@ -198,6 +202,9 @@ class MarketStateAggregator:
         """Push incoming websocket bid and ask ticks into this specific token buffer."""
         ts = timestamp or utcnow()
         token = int(instrument_token)
+        existing = self._option_token_ticks.get(token)
+        if existing is not None and not existing.empty and pd.Timestamp(existing.iloc[-1]["timestamp"]) >= pd.Timestamp(ts):
+            return
         lp = float(last_price) if last_price is not None else float((float(bid) + float(ask)) / 2.0)
         row = pd.DataFrame(
             [

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+# Project-path bootstrap must precede project imports when run directly.
+# ruff: noqa: E402
 import sys
 from pathlib import Path as _Path
 
@@ -12,7 +14,9 @@ for _p in [str(_PROJECT_ROOT), str(_PROJECT_ROOT / "src")]:
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from collections.abc import Callable
+import json
+import math
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from threading import Event, Thread
@@ -42,6 +46,10 @@ TickFrameHandler = Callable[[pd.DataFrame], None]
 RawTickHandler = Callable[[Any], None]
 
 
+class _InvalidStreamPacketError(ValueError):
+    """A redacted, recoverable packet error; never a connection shutdown."""
+
+
 @dataclass(slots=True)
 class StreamState:
     """Current Fyers DataSocket websocket stream state and subscriptions."""
@@ -55,6 +63,8 @@ class StreamState:
     duplicate_ticks: int = 0
     out_of_order_ticks: int = 0
     safe_mode: bool = False
+    dropped_packets: int = 0
+    last_packet_error: str | None = None
 
 
 class FyersStream:
@@ -281,67 +291,132 @@ class FyersStream:
                 logger.exception("Connect handler failed", error=str(exc))
 
     def _on_message(self, message: Any) -> None:
-        """Process incoming websocket ticks, normalize, and push to aggregator buffer."""
-        if self._security_guard is not None:
-            self._security_guard.register_heartbeat()
-            self._state.last_heartbeat_at = datetime.now(UTC)
+        """Reject a bad packet, never the transport; publish only validated ticks."""
+        stage = "decode"
+        try:
+            decoded = message
+            if isinstance(decoded, (str, bytes, bytearray)):
+                if decoded in ("ping", "pong", b"ping", b"pong"):
+                    self._record_packet_heartbeat()
+                    return
+                decoded = json.loads(decoded)
+            packets = [decoded] if isinstance(decoded, Mapping) else decoded
+            if not isinstance(packets, (list, tuple)) or not packets:
+                raise _InvalidStreamPacketError("Expected a tick object or non-empty tick list")
 
-        for raw_handler in self._raw_tick_handlers:
-            try:
-                raw_handler(message)
-            except Exception as exc:  # noqa: BLE001
-                logger.exception("Raw tick handler failed", error=str(exc))
+            stage = "extract"
+            ticks: list[Mapping[str, Any]] = []
+            index_symbols: set[str] = set()
+            for packet in packets:
+                if not isinstance(packet, Mapping):
+                    raise _InvalidStreamPacketError("Tick is not an object")
+                if str(packet.get("s", "")).lower() == "error":
+                    raise _InvalidStreamPacketError("Broker reported a packet/subscription error")
+                kind = packet.get("type")
+                if kind in {"cn", "sub", "unsub", "hb", "heartbeat", "ping", "pong"}:
+                    continue
+                if kind not in {None, "sf", "if"}:
+                    raise _InvalidStreamPacketError("Unsupported market message type")
+                symbol = packet.get("symbol")
+                if not isinstance(symbol, str) or not symbol.strip():
+                    raise _InvalidStreamPacketError("Missing required symbol")
+                is_index = kind == "if" or symbol.endswith("-INDEX")
 
-        normalized: NormalizedTickBatch = self._normalizer.normalize_ticks(message, source="fyers")
-        if normalized.row_count == 0:
-            return
+                def number(*keys: str, data: Mapping[str, Any] = packet) -> float:
+                    value = next((data[key] for key in keys if key in data and data[key] is not None), None)
+                    if value is None or isinstance(value, bool):
+                        raise _InvalidStreamPacketError("Missing/invalid required field: " + keys[0])
+                    result = float(value)
+                    if not math.isfinite(result):
+                        raise _InvalidStreamPacketError("Non-finite required field: " + keys[0])
+                    return result
 
-        self._state.last_tick_at = datetime.now(UTC)
+                if number("ltp", "last_price", "lp") <= 0:
+                    raise _InvalidStreamPacketError("Non-positive last price")
+                if not is_index:
+                    bid = number("bid_price", "bid", "bp")
+                    ask = number("ask_price", "ask", "ap")
+                    volume = number("vol_traded_today", "volume", "vol", "volume_traded")
+                    if bid <= 0 or ask < bid or volume < 0:
+                        raise _InvalidStreamPacketError("Invalid bid/ask/volume values")
+                else:
+                    # Fyers index packets legitimately have no bid, ask or volume.
+                    index_symbols.add(symbol)
+                if packet.get("exch_feed_time") is not None:
+                    stamp = FyersTickNormalizer._normalize_timestamp(packet["exch_feed_time"])
+                    if stamp is None or pd.isna(stamp):
+                        raise _InvalidStreamPacketError("Invalid exchange feed timestamp")
+                ticks.append(packet)
 
-        # Push bid and ask prices directly to the market state aggregator's option token buffer
-        if self._aggregator is not None:
-            for _, row in normalized.frame.iterrows():
-                tok = row.get("instrument_token")
-                bid = row.get("bid_price")
-                ask = row.get("ask_price")
-                lp = row.get("last_price")
-                ts = row.get("timestamp")
-
-                if pd.notna(tok) and pd.notna(bid) and pd.notna(ask):
-                    try:
-                        token_int = int(tok)
-                        bid_float = float(bid)
-                        ask_float = float(ask)
-                        lp_float = float(lp) if pd.notna(lp) else None
-                        ts_val = ts.to_pydatetime() if hasattr(ts, "to_pydatetime") else None
-                        self._aggregator.push_option_tick(
-                            instrument_token=token_int,
-                            bid=bid_float,
-                            ask=ask_float,
-                            timestamp=ts_val,
-                            last_price=lp_float,
-                        )
-                    except Exception as exc:  # noqa: BLE001
-                        logger.debug("Failed pushing tick to aggregator buffer", error=str(exc))
-
-        if self._security_guard is not None:
-            try:
-                notes = self._security_guard.validate_stream_frame(normalized.frame)
-                self._state.duplicate_ticks = self._security_guard.health_snapshot().duplicate_ticks
-                self._state.out_of_order_ticks = self._security_guard.health_snapshot().out_of_order_ticks
-                self._state.safe_mode = self._security_guard.safe_mode
-                logger.debug("Stream integrity notes", notes=notes)
-            except APISecurityError as exc:
-                self._state.safe_mode = True
-                logger.error("Stream integrity validation failed", error=str(exc))
-                self.stop()
+            for handler in self._raw_tick_handlers:
+                try:
+                    handler(message)
+                except Exception as e:
+                    logger.warning("Raw tick consumer failed; continuing: {}", type(e).__name__)
+            if not ticks:
+                self._record_packet_heartbeat()
                 return
 
-        for tick_handler in self._tick_handlers:
-            try:
-                tick_handler(normalized.frame)
-            except Exception as exc:  # noqa: BLE001
-                logger.exception("Tick handler failed", error=str(exc))
+            stage = "normalize"
+            normalized: NormalizedTickBatch = self._normalizer.normalize_ticks(ticks, source="fyers")
+            frame = normalized.frame
+            required = {"timestamp", "instrument_token", "tradingsymbol", "last_price", "bid_price", "ask_price", "volume_traded"}
+            if not isinstance(frame, pd.DataFrame) or not required.issubset(frame) or len(frame) != len(ticks):
+                raise _InvalidStreamPacketError("Normalizer returned an incomplete tick frame")
+            frame = frame.copy()
+            frame["timestamp"] = pd.to_datetime(frame["timestamp"], errors="coerce", utc=True)
+            if frame["timestamp"].isna().any():
+                raise _InvalidStreamPacketError("Normalized tick timestamp is invalid")
+            if any(not math.isfinite(float(value)) or float(value) <= 0 for value in frame["last_price"]):
+                raise _InvalidStreamPacketError("Invalid normalized last price")
+            options = frame.loc[~frame["tradingsymbol"].isin(index_symbols)]
+            # Validate all rows before any aggregator/strategy sees any of this batch.
+            extracted = []
+            for _, row in options.iterrows():
+                token = float(row["instrument_token"])
+                bid, ask, volume = float(row["bid_price"]), float(row["ask_price"]), float(row["volume_traded"])
+                price = float(row["last_price"])
+                if (not all(math.isfinite(value) for value in (token, bid, ask, volume, price))
+                        or token <= 0 or not token.is_integer() or bid <= 0 or ask < bid or volume < 0 or price <= 0):
+                    raise _InvalidStreamPacketError("Invalid normalized option quote or token")
+                extracted.append((int(token), bid, ask, price, row["timestamp"].to_pydatetime(warn=False)))
+
+            stage = "integrity"
+            if self._security_guard is not None:
+                self._security_guard.validate_stream_frame(frame, packet_only=True)
+                health = self._security_guard.health_snapshot()
+                self._state.duplicate_ticks = health.duplicate_ticks
+                self._state.out_of_order_ticks = health.out_of_order_ticks
+                self._state.safe_mode = self._security_guard.safe_mode
+
+            stage = "aggregate"
+            if self._aggregator is not None:
+                for token, bid, ask, price, timestamp in extracted:
+                    self._aggregator.push_option_tick(
+                        instrument_token=token, bid=bid, ask=ask,
+                        timestamp=timestamp, last_price=price,
+                    )
+            self._record_packet_heartbeat()
+            self._state.last_tick_at = datetime.now(UTC)
+            self._state.last_packet_error = None
+            for handler in self._tick_handlers:
+                try:
+                    handler(frame)
+                except Exception as e:
+                    logger.warning("Tick consumer failed; continuing: {}", type(e).__name__)
+        except Exception as e:
+            # Do not log raw packets or arbitrary exception text: either can carry
+            # authentication data. Malformed/stale packets never close the socket.
+            reason = str(e) if isinstance(e, (_InvalidStreamPacketError, APISecurityError)) else type(e).__name__
+            self._state.dropped_packets += 1
+            self._state.last_packet_error = f"{stage}: {reason}"
+            logger.warning("Skipping Fyers websocket packet ({}): {}", stage, reason)
+            return
+
+    def _record_packet_heartbeat(self) -> None:
+        if self._security_guard is not None:
+            self._security_guard.register_heartbeat()
+        self._state.last_heartbeat_at = datetime.now(UTC)
 
     def _on_close(self, code: int | None = None, reason: str | None = None) -> None:
         self._state.connected = False

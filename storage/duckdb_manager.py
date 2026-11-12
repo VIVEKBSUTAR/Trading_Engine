@@ -115,6 +115,9 @@ class DuckDBManager:
             self._tmp_copy = None
 
     def _bootstrap(self) -> None:
+        self._con.execute("""CREATE TABLE IF NOT EXISTS lifecycle_alerts (
+            event_id VARCHAR PRIMARY KEY, timestamp TIMESTAMPTZ, alert_type VARCHAR,
+            trade_id VARCHAR, action VARCHAR, strike DOUBLE, premium DOUBLE)""")
         self._con.execute(
             """
             CREATE TABLE IF NOT EXISTS ingestion_snapshots (
@@ -397,6 +400,15 @@ class DuckDBManager:
         """Retrieve recent signal records."""
         limit_sql = f"LIMIT {limit}" if limit else ""
         return self.query(f"SELECT * FROM signals ORDER BY timestamp DESC {limit_sql}")
+
+    def insert_lifecycle_alert(self, event: dict) -> None:
+        self._con.execute("INSERT INTO lifecycle_alerts VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING",
+                          [event[k] for k in ("event_id", "timestamp", "alert_type", "trade_id", "action", "strike", "premium")])
+
+    def get_lifecycle_alerts(self, now: datetime | None = None) -> pd.DataFrame:
+        now = now or datetime.now(UTC)
+        return self.query("SELECT * FROM lifecycle_alerts WHERE timestamp BETWEEN ? AND ? ORDER BY timestamp DESC",
+                          [now - timedelta(seconds=60), now])
 
     def get_live_signals(self, *, now: datetime | None = None) -> pd.DataFrame:
         """Passed directional alerts, independently of the 50-row audit window."""

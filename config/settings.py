@@ -1,4 +1,4 @@
-"""Centralized configuration for NSE option-chain ingestion pipeline."""
+"""Centralized configuration for the Fyers analytical signal runtime."""
 
 from __future__ import annotations
 
@@ -11,32 +11,11 @@ from dotenv import load_dotenv
 
 @dataclass(slots=True)
 class APISettings:
-    """HTTP endpoint and header configuration for NSE API calls."""
+    """Shared HTTP timeout/retry defaults; no public-exchange scraper endpoints."""
 
-    option_chain_url: str = "https://www.nseindia.com/api/option-chain-indices?symbol=NIFTY"
-    bootstrap_url: str = "https://www.nseindia.com"
-    bootstrap_urls: tuple[str, ...] = (
-        "https://www.nseindia.com",
-        "https://www.nseindia.com/option-chain",
-        "https://www.nseindia.com/market-data/live-equity-market",
-    )
     timeout_seconds: int = 15
     max_retries: int = 4
     backoff_seconds: float = 1.5
-    headers: dict[str, str] = field(
-        default_factory=lambda: {
-            "User-Agent": (
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/125.0.0.0 Safari/537.36"
-            ),
-            "Accept": "application/json, text/plain, */*",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Referer": "https://www.nseindia.com/option-chain",
-            "Connection": "keep-alive",
-            "X-Requested-With": "XMLHttpRequest",
-        }
-    )
 
 
 @dataclass(slots=True)
@@ -169,7 +148,8 @@ class IntelligenceSettings:
     signal_ttl_min_candles: int = 2
     signal_ttl_max_candles: int = 4
     max_spread_percentage: float = 0.05
-    max_implied_volatility_percentile: float = 0.90
+    max_implied_volatility_percentile: float = 0.50
+    pcr_drop_fraction: float = 0.20
 
 
 @dataclass(slots=True)
@@ -322,7 +302,8 @@ class AppSettings:
                 signal_ttl_min_candles=int(os.getenv("TE_SIGNAL_TTL_MIN_CANDLES", "2")),
                 signal_ttl_max_candles=int(os.getenv("TE_SIGNAL_TTL_MAX_CANDLES", "4")),
                 max_spread_percentage=float(os.getenv("TE_MAX_SPREAD_PERCENTAGE", "0.05")),
-                max_implied_volatility_percentile=float(os.getenv("TE_MAX_IMPLIED_VOLATILITY_PERCENTILE", "0.90")),
+                pcr_drop_fraction=float(os.getenv("TE_PCR_DROP_FRACTION", "0.20")),
+                max_implied_volatility_percentile=float(os.getenv("TE_MAX_IMPLIED_VOLATILITY_PERCENTILE", "0.50")),
             ),
             risk=RiskSettings(
                 capital=float(os.getenv("TE_CAPITAL", "10000000")),

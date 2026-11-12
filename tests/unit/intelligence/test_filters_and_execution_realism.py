@@ -119,11 +119,11 @@ def test_step3_intelligence_settings_defaults():
     assert hasattr(settings, "max_spread_percentage")
     assert settings.max_spread_percentage == pytest.approx(0.05)
     assert hasattr(settings, "max_implied_volatility_percentile")
-    assert settings.max_implied_volatility_percentile == pytest.approx(0.90)
+    assert settings.max_implied_volatility_percentile == pytest.approx(0.50)
 
     app_settings = AppSettings.from_env()
     assert app_settings.intelligence.max_spread_percentage == pytest.approx(0.05)
-    assert app_settings.intelligence.max_implied_volatility_percentile == pytest.approx(0.90)
+    assert app_settings.intelligence.max_implied_volatility_percentile == pytest.approx(0.50)
 
 
 def test_step1_liquidity_filter_rejects_wide_spread(current_option_chain):
@@ -195,7 +195,7 @@ def test_step1_liquidity_filter_accepts_tight_spread(current_option_chain):
         probabilities=probs,
         trap=trap,
         regime=regime,
-        option_chain=option_chain,
+        option_chain=option_chain, historical_iv_window=[.3] * 20,
     )
     assert signal.action == SignalAction.BUY_CE
 
@@ -225,11 +225,11 @@ def test_step2_volatility_filter_rejects_top_decile_iv(current_option_chain):
 
     # Check direct filter method
     passed, iv_val, percentile, reason = engine.check_volatility_filter(
-        24000.0, OptionSide.CE, option_chain, historical_iv_window=historical_iv
+        24000.0, OptionSide.CE, option_chain, historical_iv_window=historical_iv * 2
     )
     assert passed is False
     assert percentile >= 0.90
-    assert "volatility filter" in reason.lower()
+    assert "iv percentile" in reason.lower()
 
     # Check signal generation returns NO_TRADE
     signal = engine.generate(
@@ -238,10 +238,10 @@ def test_step2_volatility_filter_rejects_top_decile_iv(current_option_chain):
         trap=trap,
         regime=regime,
         option_chain=option_chain,
-        historical_iv_window=historical_iv,
+        historical_iv_window=historical_iv * 2,
     )
     assert signal.action == SignalAction.NO_TRADE
-    assert any("volatility filter" in r.lower() for r in signal.reasoning)
+    assert any("iv percentile" in r.lower() for r in signal.reasoning)
 
 
 def test_step2_volatility_filter_accepts_normal_iv(current_option_chain):
@@ -267,7 +267,7 @@ def test_step2_volatility_filter_accepts_normal_iv(current_option_chain):
     option_chain = current_option_chain(option_chain, state.timestamp)
 
     passed, iv_val, percentile, reason = engine.check_volatility_filter(
-        24000.0, OptionSide.CE, option_chain, historical_iv_window=historical_iv
+        24000.0, OptionSide.CE, option_chain, historical_iv_window=historical_iv * 2
     )
     assert passed is True
     assert percentile < 0.90
@@ -278,7 +278,7 @@ def test_step2_volatility_filter_accepts_normal_iv(current_option_chain):
         trap=trap,
         regime=regime,
         option_chain=option_chain,
-        historical_iv_window=historical_iv,
+        historical_iv_window=historical_iv * 2,
     )
     assert signal.action == SignalAction.BUY_CE
 

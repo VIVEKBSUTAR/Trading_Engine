@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
+import re
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-import re
-from typing import Any
+from typing import Any, NoReturn
 
 import pandas as pd
 
@@ -198,24 +198,27 @@ class APISecurityGuard:
                 f"(market may be closed or instrument not available)"
             )
 
-    def validate_stream_frame(self, frame: pd.DataFrame) -> list[str]:
+    def validate_stream_frame(self, frame: pd.DataFrame, *, packet_only: bool = False) -> list[str]:
+        """Reject invalid data; Fyers packet errors do not latch global safe mode."""
+        def reject(reason: str) -> NoReturn:
+            if not packet_only:
+                self.mark_safe_mode(reason)
+            raise APISecurityError(reason)
+
         if frame is None or frame.empty:
             self._stale_stream_count += 1
-            self.mark_safe_mode("Empty websocket tick frame")
-            raise APISecurityError("Empty websocket tick frame")
+            reject("Empty websocket tick frame")
 
         if "timestamp" not in frame.columns:
             self._stale_stream_count += 1
-            self.mark_safe_mode("Tick frame missing timestamp column")
-            raise APISecurityError("Tick frame missing timestamp column")
+            reject("Tick frame missing timestamp column")
 
         working = frame.copy()
         working["timestamp"] = pd.to_datetime(working["timestamp"], utc=True, errors="coerce")
         working = working.dropna(subset=["timestamp"])
         if working.empty:
             self._stale_stream_count += 1
-            self.mark_safe_mode("Tick frame timestamps could not be parsed")
-            raise APISecurityError("Tick frame timestamps could not be parsed")
+            reject("Tick frame timestamps could not be parsed")
 
         ts = working["timestamp"]
         if not ts.is_monotonic_increasing:
@@ -223,22 +226,28 @@ class APISecurityGuard:
             self._out_of_order_ticks += out_of_order
             self._notes.append(f"out_of_order_ticks={out_of_order}")
             if out_of_order >= self._settings.max_out_of_order_ticks:
+                if packet_only:
+                    reject("Out-of-order tick threshold exceeded")
                 self.mark_safe_mode("Out-of-order tick threshold exceeded")
 
         subset = [column for column in ("instrument_token", "timestamp", "last_price") if column in working.columns]
         duplicates = int(working.duplicated(subset=subset, keep="last").sum()) if subset else 0
         self._duplicate_ticks += duplicates
         if duplicates >= self._settings.max_duplicate_ticks:
+            if packet_only:
+                reject("Duplicate tick threshold exceeded")
             self.mark_safe_mode("Duplicate tick threshold exceeded")
 
-        latest_tick = ts.max().to_pydatetime()
-        self._last_stream_at = latest_tick
-        self._last_heartbeat_at = datetime.now(UTC)
+        latest_tick = ts.max().to_pydatetime(warn=False)
         stale_age = (datetime.now(UTC) - latest_tick.astimezone(UTC)).total_seconds()
         if stale_age > self._settings.stale_stream_seconds:
             self._stale_stream_count += 1
-            self.mark_safe_mode(f"Stale websocket frame: age={stale_age:.1f}s")
-            raise APISecurityError(f"Stale websocket frame: {stale_age:.1f}s old")
+            reject(f"Stale websocket frame: {stale_age:.1f}s old")
+        if stale_age < -self._settings.max_payload_age_seconds:
+            self._stale_stream_count += 1
+            reject("Websocket frame timestamp is in the future")
+        self._last_stream_at = latest_tick
+        self._last_heartbeat_at = datetime.now(UTC)
 
         return [f"duplicate_ticks={duplicates}", f"out_of_order_ticks={self._out_of_order_ticks}"]
 

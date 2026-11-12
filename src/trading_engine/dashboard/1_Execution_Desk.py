@@ -1,4 +1,4 @@
-"""Default terminal page: fresh signals, active positions, and system health."""
+"""Default terminal page: ENTRY_BUY / explicit EXIT alerts, active positions, and system health."""
 import streamlit as st
 
 from trading_engine.dashboard.shared import execution_desk, inject_styles

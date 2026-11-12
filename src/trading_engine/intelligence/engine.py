@@ -35,7 +35,13 @@ from trading_engine.intelligence.models import (
     TrapResult,
     utcnow,
 )
-from trading_engine.intelligence.monitor import LiveTradeMonitor
+from trading_engine.intelligence.monitor import LiveTradeMonitor, MonitorConfig
+from trading_engine.intelligence.options_math import (
+    enrich_chain,
+    latest_chain,
+    positioning,
+    underlying_atr,
+)
 from trading_engine.intelligence.state import MarketStateAggregator, StateConfig
 
 
@@ -44,6 +50,9 @@ class IntelligenceEngineConfig:
     """Runtime configuration for the live intelligence orchestrator."""
 
     lookback_bars: int = 50
+
+
+
 
 
 class LiveIntelligenceEngine:
@@ -63,7 +72,7 @@ class LiveIntelligenceEngine:
                 self._duckdb_manager = DuckDBManager(settings.storage.duckdb_path)
             except Exception:
                 self._duckdb_manager = DuckDBManager()
-        self._monitor = monitor or LiveTradeMonitor(duckdb_manager=self._duckdb_manager)
+        self._monitor = monitor or LiveTradeMonitor(MonitorConfig(pcr_drop_fraction=settings.intelligence.pcr_drop_fraction), duckdb_manager=self._duckdb_manager)
         if self._monitor.duckdb_manager is None:
             self._monitor.duckdb_manager = self._duckdb_manager
         self._state_aggregator = MarketStateAggregator(
@@ -98,7 +107,7 @@ class LiveIntelligenceEngine:
                 trap_cutoff=settings.intelligence.trap_probability_threshold,
                 min_trade_quality=settings.intelligence.trade_quality_threshold,
                 max_spread_percentage=getattr(settings.intelligence, "max_spread_percentage", 0.05),
-                max_implied_volatility_percentile=getattr(settings.intelligence, "max_implied_volatility_percentile", 0.90),
+                max_implied_volatility_percentile=getattr(settings.intelligence, "max_implied_volatility_percentile", 0.50),
             )
         )
         self._strike_engine = StrikeSelectionEngine(StrikeSelectionConfig())
@@ -107,7 +116,7 @@ class LiveIntelligenceEngine:
                 capital=settings.risk.capital,
                 risk_per_trade=settings.risk.risk_per_trade,
                 max_capital_exposure=settings.risk.max_capital_exposure,
-                contract_multiplier=settings.risk.contract_multiplier,
+                contract_multiplier=LiveTradeMonitor.NIFTY_LOT_SIZE,
                 min_units=settings.risk.min_units,
                 max_daily_loss_pct=settings.intelligence.max_daily_loss_pct,
                 max_trades_per_day=settings.intelligence.max_trades_per_day,
@@ -144,6 +153,20 @@ class LiveIntelligenceEngine:
         """Generate a full intelligence report from a live market snapshot."""
         latency = LatencyTrace(data_received_at=data_received_at or datetime.now(UTC))
 
+        snapshot.option_chain_frame = enrich_chain(snapshot.option_chain_frame, spot=snapshot.spot_price, now=snapshot.timestamp)
+        atr = underlying_atr(snapshot.spot_frame, now=snapshot.timestamp)
+        spot_time = pd.to_datetime(snapshot.spot_frame.iloc[-1].get("timestamp"), utc=True, errors="coerce") if not snapshot.spot_frame.empty else pd.NaT
+        spot_fresh = not pd.isna(spot_time) and 0 <= (pd.Timestamp(snapshot.timestamp) - spot_time).total_seconds() <= 2
+        self._monitor.context = {"spot": snapshot.spot_price if spot_fresh else None, "atr": atr}
+        self._monitor.contract_context = {}
+        chain = snapshot.option_chain_frame
+        if not chain.empty:
+            for expiry, group in chain.groupby("expiry"):
+                pcr, pain = positioning(group)
+                for _, row in group.iterrows():
+                    self._monitor.contract_context[(str(expiry), float(row.strike), str(row.option_type))] = {
+                        "pcr": pcr, "max_pain": pain, "delta": row.get("delta"),
+                        "iv": row.get("implied_volatility", row.get("iv")), "timestamp": row.get("timestamp")}
         features = build_live_features(snapshot, lookback_bars=self._settings.intelligence.structure_lookback_bars)
         latency.features_computed_at = datetime.now(UTC)
         if features.frame.empty:
@@ -199,6 +222,27 @@ class LiveIntelligenceEngine:
             signal.strike = strike
         else:
             strike = signal.strike
+        token, ask_price, bid_price, chosen_strike, chosen_expiry, chosen_side = self._resolve_option_contract_details(signal, chain)
+        live_quote = self._state_aggregator.get_latest_option_tick(token)
+        live_age = None
+        if live_quote is not None:
+            live_age = (snapshot.timestamp - pd.Timestamp(live_quote["timestamp"]).to_pydatetime()).total_seconds()
+            if 0 <= live_age <= 2:
+                bid_price, ask_price = live_quote["bid_price"], live_quote["ask_price"]
+        signal.entry_reference = ask_price
+        signal.underlying_atr = atr
+        distance = atr * abs(strike.delta) if atr and strike.delta else None
+        quote_time = self._quote_timestamp(chain, chosen_expiry, chosen_strike, chosen_side)
+        quote_age = (snapshot.timestamp - quote_time).total_seconds()
+        if signal.action != SignalAction.NO_TRADE and (not distance or ask_price <= distance or token <= 0
+                                                       or not 0 <= quote_age <= 45
+                                                       or not (0 <= quote_age <= 2 or (live_age is not None and 0 <= live_age <= 2))
+                                                       or bid_price <= 0 or ask_price < bid_price):
+            signal.action = SignalAction.NO_TRADE
+            signal.filter_passed = False
+            signal.filter_rejection_reason = "NIFTY ATR warming up, stale contract context, or invalid premium stop"
+        signal.stop_loss = ask_price - distance if distance and ask_price > distance else None
+        signal.target = None
         risk = self._risk_engine.plan(
             state=state,
             signal=signal,
@@ -208,13 +252,9 @@ class LiveIntelligenceEngine:
         )
         signal.quantity = risk.quantity if risk.allowed else 0
         signal.stop_loss = risk.stop_loss
-        signal.target = risk.target
+        signal.target = None
+        risk.target = None
         signal.signal_ttl_candles = max(int(signal.signal_ttl_candles or 1), int(state.signal_ttl_candles or 1))
-
-        # Resolve specific option instrument token and exact entry ask price from the option chain snapshot
-        token, ask_price, bid_price, chosen_strike, chosen_expiry, chosen_side = self._resolve_option_contract_details(
-            signal, snapshot.option_chain_frame
-        )
 
         # Step 4: Write complete record to signals table for both accepted and rejected setups
         if signal.filter_passed is not None or signal.action != SignalAction.NO_TRADE:
@@ -235,7 +275,7 @@ class LiveIntelligenceEngine:
                 instrument_token=token,
                 bid=bid_price,
                 ask=ask_price,
-                timestamp=snapshot.timestamp or utcnow(),
+                timestamp=self._quote_timestamp(chain, chosen_expiry, chosen_strike, chosen_side),
                 last_price=ask_price,
             )
 
@@ -250,7 +290,7 @@ class LiveIntelligenceEngine:
                         instrument_token=trade.instrument_token,
                         bid=t_bid,
                         ask=t_ask,
-                        timestamp=snapshot.timestamp or utcnow(),
+                        timestamp=self._quote_timestamp(chain, trade.expiry, trade.strike, trade.option_type),
                         last_price=t_bid,
                     )
 
@@ -397,12 +437,12 @@ class LiveIntelligenceEngine:
                     matches = exp_matches
 
             if not matches.empty:
-                row = matches.iloc[0]
+                row = latest_chain(matches).iloc[-1]
                 strike_val = float(row.get("strike", strike_val))
                 expiry_val = str(row.get("expiry", expiry_val))
                 side_val = str(row.get("option_type", side_val))
 
-                ask_price = _safe_float(row.get("ask_price") or row.get("ask") or row.get("last_price"))
+                ask_price = _safe_float(row.get("ask_price") or row.get("ask"))
                 bid_price = _safe_float(row.get("bid_price") or row.get("bid"))
 
                 tok = row.get("instrument_token")
@@ -412,16 +452,17 @@ class LiveIntelligenceEngine:
                     except (ValueError, TypeError):
                         token = None
 
-        # Fallbacks for pricing and token
-        if ask_price is None or ask_price <= 0:
-            ask_price = float(signal.entry_reference or 100.0)
-        if bid_price is None or bid_price <= 0:
-            bid_price = float(ask_price * 0.99)
-        if token is None or token <= 0:
-            side_mult = 1 if target_side.upper() == "CE" else 2
-            token = int(strike_val * 10 + side_mult)
+        ask_price = ask_price or 0.0
+        bid_price = bid_price or 0.0
+        token = token or 0
 
         return token, ask_price, bid_price, strike_val, expiry_val, side_val
+
+    @staticmethod
+    def _quote_timestamp(chain, expiry, strike, side):
+        rows = chain.loc[(chain.expiry.astype(str) == str(expiry)) & (chain.strike == strike) & (chain.option_type == side)] if not chain.empty else chain
+        stamp = pd.to_datetime(rows.iloc[-1].get("timestamp"), utc=True, errors="coerce") if not rows.empty else pd.NaT
+        return stamp.to_pydatetime() if not pd.isna(stamp) else datetime(1970, 1, 1, tzinfo=UTC)
 
     def _persist_signal_record(
         self,

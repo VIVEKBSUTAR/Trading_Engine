@@ -34,9 +34,9 @@ def test_live_query_is_independent_of_fifty_row_audit_and_excludes_stale_future_
 
 def test_toast_is_emitted_once_per_new_batch_and_never_for_expired_signal():
     now = datetime.now(UTC)
-    row = {"signal_id": "s1", "timestamp": now.isoformat(), "action": "BUY_CE",
+    row = {"event_id": "s1", "alert_type": "ENTRY_BUY", "premium": 101.25, "signal_id": "s1", "timestamp": now.isoformat(), "action": "BUY_CE",
            "strike": 24500, "entry_price": 101.25, "filter_passed": True}
-    payload = {"source": "snapshot", "timestamp": now.isoformat(), "live_signals": [row]}
+    payload = {"source": "snapshot", "timestamp": now.isoformat(), "lifecycle_alerts": [row]}
     with patch.object(shared.st, "session_state", {}), patch.object(shared.st, "toast") as toast, \
          patch.object(shared.st, "success") as success, patch.object(shared.st, "caption"):
         shared.render_live_alert(payload)
@@ -44,7 +44,7 @@ def test_toast_is_emitted_once_per_new_batch_and_never_for_expired_signal():
         assert toast.call_count == 1
         assert "₹101.25" in toast.call_args.args[0]
         assert success.call_count == 2
-        row["signal_id"] = "s2"
+        row["event_id"] = "s2"
         shared.render_live_alert(payload)
         assert toast.call_count == 2
         row["timestamp"] = (now - timedelta(seconds=61)).isoformat()

@@ -1,10 +1,12 @@
-"""Live runtime wiring for Fyers API V3, NSE option chain, and intelligence engines."""
+"""Live runtime wiring for the unified Fyers API V3 market-data pipeline."""
 
 from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from functools import wraps
+from threading import RLock
 
 import pandas as pd
 from loguru import logger
@@ -15,11 +17,16 @@ from broker.fyers_client import FyersMarketClient
 from broker.fyers_stream import FyersStream
 from broker.normalizer import NormalizedTickBatch
 from config.settings import AppSettings
-from ingestion.nse_fetcher import NSEOptionChainFetcher
-from ingestion.parser import OptionChainParser
-from ingestion.validators import OptionChainValidator
 from trading_engine.intelligence.engine import LiveIntelligenceEngine
 from trading_engine.intelligence.models import IntelligenceReport, MarketState
+
+
+def synchronized(method):
+    @wraps(method)
+    def wrapped(self, *args, **kwargs):
+        with self._evaluation_lock:
+            return method(self, *args, **kwargs)
+    return wrapped
 
 
 @dataclass(slots=True)
@@ -34,6 +41,7 @@ class LiveIntelligenceRuntime:
     """Wire live market sources into the intelligence engine and monitor."""
 
     def __init__(self, settings: AppSettings, callbacks: RuntimeCallbacks | None = None) -> None:
+        self._evaluation_lock = RLock()
         self._settings = settings
         self._callbacks = callbacks or RuntimeCallbacks()
         self._security = APISecurityGuard(settings.security)
@@ -47,9 +55,6 @@ class LiveIntelligenceRuntime:
             security_guard=self._security,
             aggregator=self._aggregator,
         )
-        self._fetcher = NSEOptionChainFetcher(settings.api)
-        self._parser = OptionChainParser()
-        self._validator = OptionChainValidator()
         self._latest_report: IntelligenceReport | None = None
         self._latest_state: MarketState | None = None
 
@@ -87,27 +92,16 @@ class LiveIntelligenceRuntime:
         return self._engine.monitor
 
     def refresh_once(self) -> IntelligenceReport:
-        """Poll REST sources once and compute a fresh intelligence report."""
+        """Poll Fyers once for spot/VIX and option chain, then build the report."""
         self._security.validate_environment()
         snapshot = self._client.get_live_snapshot()
-        self._aggregator.update_from_snapshot(snapshot)
+        return self._apply_snapshot(snapshot)
 
-        try:
-            chain_result = self._fetcher.fetch_option_chain()
-            self._security.validate_fresh_timestamp(
-                chain_result.fetched_at_utc,
-                max_age_seconds=self._settings.security.stale_option_chain_seconds,
-                label="option_chain",
-            )
-            chain_frame = self._parser.parse(chain_result.payload, chain_result.fetched_at_utc)
-            validated = self._validator.validate(chain_frame)
-            self._aggregator.update_option_chain(validated.frame)
-            self._security.register_rest_success()
-        except Exception as exc:  # noqa: BLE001
-            self._security.register_rest_failure(f"option_chain_refresh_failed:{exc}")
-            logger.warning("Option-chain refresh failed; continuing with cached state", error=str(exc))
-            if self._callbacks.on_error:
-                self._callbacks.on_error(exc)
+    @synchronized
+    def _apply_snapshot(self, snapshot) -> IntelligenceReport:
+        # FyersMarketClient already fetches and normalizes the option chain.
+        # Route that exact frame alongside the spot/VIX snapshot; no website fallback.
+        self._aggregator.update_from_snapshot(snapshot, option_chain=snapshot.option_instruments)
 
         snapshot_bundle = self._aggregator.build_snapshot()
         state = self._aggregator.build_market_state(snapshot_bundle)
@@ -143,9 +137,7 @@ class LiveIntelligenceRuntime:
         if snapshot.nifty_spot.last_price is None or snapshot.option_instruments.empty:
             return
 
-        spot = snapshot.nifty_spot.last_price
-        atm_strike = round(spot / 50) * 50
-        target_strikes = [atm_strike + offset for offset in range(-150, 200, 50)]
+
 
         df = snapshot.option_instruments.copy()
         if "expiry" not in df.columns or "strike" not in df.columns or "instrument_token" not in df.columns:
@@ -158,12 +150,12 @@ class LiveIntelligenceRuntime:
             future_expiries = df
 
         nearest_expiry = future_expiries["expiry_date"].min()
-        relevant = future_expiries[
-            (future_expiries["expiry_date"] == nearest_expiry)
-            & (future_expiries["strike"].isin(target_strikes))
-        ]
+        relevant = future_expiries.loc[future_expiries["expiry_date"] == nearest_expiry]
+        active_tokens = {trade.instrument_token for trade in self.monitor.open_trades}
+        active = df.loc[df.instrument_token.isin(active_tokens)]
+        relevant = pd.concat([relevant, active]).drop_duplicates("instrument_token")
         if relevant.empty:
-            relevant = future_expiries.head(10)
+            return
 
         # Register symbol-token mapping with stream
         for _, r in relevant.iterrows():
@@ -173,6 +165,7 @@ class LiveIntelligenceRuntime:
                 self._stream.register_symbol_token(str(sym), int(tok))
 
         tokens = set(relevant["instrument_token"].astype(int).tolist())
+        tokens.update(active_tokens)
         tokens.update(self._settings.fyers.stream_tokens)
 
         symbols = [str(s) for s in relevant["symbol"].dropna().tolist()] if "symbol" in relevant.columns else []
@@ -190,6 +183,7 @@ class LiveIntelligenceRuntime:
             if self._callbacks.on_error:
                 self._callbacks.on_error(exc)
 
+    @synchronized
     def _on_tick_frame(self, frame: pd.DataFrame) -> None:
         data_received_at = datetime.now(UTC)
         self._aggregator.update_ticks(NormalizedTickBatch(frame=frame, row_count=len(frame), source="fyers"))

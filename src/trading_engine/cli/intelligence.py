@@ -64,10 +64,12 @@ def main() -> int:
         else:
             logger.warning("No stream tokens configured. Running in polling mode only.")
 
+        last_chain_refresh = time.monotonic()
         while not shutdown_event.is_set():
-            if not streaming:
+            if not streaming or time.monotonic() - last_chain_refresh >= 15:
                 try:
                     runtime.refresh_once()
+                    last_chain_refresh = time.monotonic()
                 except Exception as exc:  # noqa: BLE001
                     _on_error(exc)
             time.sleep(max(settings.intelligence.dashboard_refresh_seconds, 1))
@@ -98,6 +100,7 @@ def publish_dashboard_snapshot(directory: Path, report: IntelligenceReport, runt
             "last_tick_at": runtime.stream.state.last_tick_at,
             "safe_mode": runtime.stream.state.safe_mode,
         },
+        "lifecycle_alerts": runtime.engine.duckdb_manager.get_lifecycle_alerts().to_dict("records"),
         "live_signals": runtime.engine.duckdb_manager.get_live_signals().to_dict("records"),
         "signals": runtime.engine.duckdb_manager.get_signals(limit=50).to_dict("records"),
         "outcomes": runtime.engine.duckdb_manager.get_trade_outcomes(limit=1000).to_dict("records"),
@@ -108,6 +111,8 @@ def publish_dashboard_snapshot(directory: Path, report: IntelligenceReport, runt
             "unrealized_pnl": runtime.monitor.calculate_profit(trade),
             "entry_ask": trade.entry_ask_price, "current_bid": trade.current_bid_price,
             "stop_loss": trade.signal.stop_loss, "is_frozen": trade.is_frozen,
+            "live_iv": trade.live_iv, "delta": trade.delta,
+            "time_in_trade": max(0, (report.timestamp - trade.opened_at).total_seconds() / 60),
         } for trade in runtime.monitor.open_trades],
     }
     path = None

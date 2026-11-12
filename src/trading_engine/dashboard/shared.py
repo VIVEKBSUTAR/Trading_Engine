@@ -102,6 +102,7 @@ def load_terminal_data(*, analytics: bool = False) -> dict[str, Any]:
         manager = get_dashboard_duckdb_manager(settings)
         return {
             "source": "database", "timestamp": datetime.now(UTC).isoformat(),
+            "lifecycle_alerts": manager.get_lifecycle_alerts().to_dict("records"),
             "live_signals": query_live_signals(manager).to_dict("records"),
             "signals": query_recent_signals(manager).to_dict("records") if analytics else [],
             "outcomes": manager.get_trade_outcomes().to_dict("records") if analytics else [],
@@ -137,26 +138,28 @@ def render_live_alert(payload: dict[str, Any]) -> None:
     # Never present a cached signal as live after engine publication stops.
     if payload.get("source") == "snapshot" and not 0 <= publication_age(payload) <= PUBLICATION_STALE_SECONDS:
         return
-    frame = recent_passed_signals(pd.DataFrame(payload.get("live_signals", [])))
-    if frame.empty:
-        st.caption("Monitoring · No fresh passed call or put signal.")
+    events = pd.DataFrame(payload.get("lifecycle_alerts", []))
+    if events.empty:
+        st.caption("Monitoring · No fresh lifecycle alert.")
         return
-    row = frame.iloc[0]
-    action = str(row["action"]).upper()
-    strike = _number(row.get("strike"), decimals=0)
-    entry = _number(row.get("entry_price"), prefix="₹")
-    message = f"{action}  ·  Strike {strike}  ·  Entry {entry}"
-    st.success(message, icon="🔔")
-    seen = st.session_state.get("seen_signal_alerts", {})
-    seen = {key: stamp for key, stamp in seen.items() if stamp >= datetime.now(UTC).timestamp() - LIVE_WINDOW_SECONDS}
-    signal_id = str(row.get("signal_id") or f"{row['timestamp']}:{action}:{strike}")
-    if signal_id not in seen:
-        st.toast(message, icon="🔔")
-    # Mark the entire current batch; older records must not surface as new later.
-    for _, item in frame.iterrows():
-        key = str(item.get("signal_id") or f"{item['timestamp']}:{str(item['action']).upper()}:{_number(item.get('strike'), decimals=0)}")
-        seen[key] = item["timestamp"].timestamp()
-    st.session_state["seen_signal_alerts"] = seen
+    stamps = pd.to_datetime(events.timestamp, utc=True, errors="coerce")
+    now = pd.Timestamp.now(tz="UTC")
+    events = events.loc[stamps.between(now - pd.Timedelta(seconds=60), now)].copy()
+    if events.empty:
+        return
+    events = events.sort_values("timestamp", ascending=False)
+    # Surface exits before entries when both occur during the same refresh window.
+    events["_exit"] = events.alert_type.str.startswith("EXIT_")
+    events = events.sort_values("_exit", ascending=False, kind="stable")
+    seen = st.session_state.get("seen_lifecycle_alerts", {})
+    seen = {key: value for key, value in seen.items() if value >= now.timestamp() - 60}
+    for _, event in events.head(10).iterrows():
+        message = f"{event.alert_type} · {str(event.get('action', '')).upper()} · Strike {_number(event.get('strike'), decimals=0)} · Premium {_number(event.get('premium'), prefix='₹')}"
+        (st.error if event["_exit"] else st.success)(message, icon="🔔")
+        if event.event_id not in seen:
+            st.toast(message, icon="🔔")
+        seen[event.event_id] = now.timestamp()
+    st.session_state["seen_lifecycle_alerts"] = seen
 
 
 def render_health(payload: dict[str, Any]) -> None:
@@ -188,7 +191,8 @@ def positions_frame(positions: list[dict[str, Any]]) -> pd.DataFrame:
         rows.append({
             "Position": position.get("trade_id"), "Strike": position.get("strike"),
             "Side": position.get("option_type"), "Lots": quantity,
-            "Entry Ask": position.get("entry_ask"), "Current Bid": position.get("current_bid"),
+            "Entry Ask": position.get("entry_ask"), "Live Premium": position.get("current_bid"),
+            "Time in Trade": position.get("time_in_trade"), "Live IV": position.get("live_iv"),
             "Trailing Stop": position.get("stop_loss"), "Unrealized PnL": pnl,
             "Data": "FROZEN" if position.get("is_frozen") else "Live",
         })
@@ -202,7 +206,7 @@ def style_positions(frame: pd.DataFrame):
         return "color: #00FF00" if value > 0 else "color: #FF5252"
     return (frame.style.map(color, subset=["Unrealized PnL"])
         .set_properties(subset=["Trailing Stop"], **{"font-weight": "700"})
-        .format({"Strike": "{:,.0f}", "Entry Ask": "₹{:,.2f}", "Current Bid": "₹{:,.2f}",
+        .format({"Strike": "{:,.0f}", "Entry Ask": "₹{:,.2f}", "Live Premium": "₹{:,.2f}", "Time in Trade": "{:.1f} min", "Live IV": "{:.2f}%",
                  "Trailing Stop": "₹{:,.2f}", "Unrealized PnL": "₹{:+,.2f}"}, na_rep="—"))
 
 
@@ -227,7 +231,8 @@ def _render_active_positions(monitor, report) -> None:
         "trade_id": trade.trade_id, "strike": trade.strike, "option_type": trade.option_type,
         "quantity": trade.quantity, "entry_ask": trade.entry_ask_price, "current_bid": trade.current_bid_price,
         "stop_loss": trade.signal.stop_loss, "unrealized_pnl": compute_unrealized_pnl(trade),
-        "is_frozen": trade.is_frozen,
+        "is_frozen": trade.is_frozen, "live_iv": trade.live_iv,
+        "time_in_trade": max(0, (datetime.now(UTC) - trade.opened_at).total_seconds() / 60),
     } for trade in trades])
 
 

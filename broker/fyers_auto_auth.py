@@ -60,13 +60,14 @@ def authenticate(settings: FyersSettings, session: requests.Session) -> str:
     login = post(session, f"{SSO}/send_login_otp_v2", {
         "fy_id": encoded(settings.user_id), "app_id": "2",
     })
-    totp = pyotp.TOTP(settings.totp_secret)
+    totp_secret = settings.totp_secret
+    totp = pyotp.TOTP(totp_secret)
     # Avoid sending an OTP immediately before its validity boundary.
     remaining = totp.interval - (time.time() % totp.interval)
     if remaining < 5:
         time.sleep(remaining + 0.1)
     verified = post(session, f"{SSO}/verify_otp", {
-        "request_key": required(login, "request_key"), "otp": totp.now(),
+        "request_key": required(login, "request_key"), "otp": pyotp.TOTP(totp_secret).now(),
     })
     pin = post(session, f"{SSO}/verify_pin_v2", {
         "request_key": required(verified, "request_key"),

@@ -26,6 +26,7 @@ from trading_engine.intelligence.models import (
     TrapResult,
     TrendState,
 )
+from trading_engine.intelligence.options_math import enrich_chain, latest_chain, number, positioning
 
 
 @dataclass(slots=True)
@@ -66,7 +67,7 @@ class SignalEngineConfig:
     chop_cutoff: float = 0.68
     instability_cutoff: float = 0.65
     max_spread_percentage: float = 0.05
-    max_implied_volatility_percentile: float = 0.90
+    max_implied_volatility_percentile: float = 0.50
 
 
 @dataclass(slots=True)
@@ -270,13 +271,30 @@ class TrapDetectionEngine:
         )
 
 
+
+
+
 class SignalGenerationEngine:
     """Translate probabilities and trap diagnostics into a filtered trading signal."""
 
     def __init__(self, config: SignalEngineConfig | None = None) -> None:
         self._config = config or SignalEngineConfig()
-        self._historical_iv: dict[tuple[float, str], list[float]] = {}
+        self._historical_iv: dict[tuple, list[float]] = {}
         self._signal_counter = itertools.count(1)
+        self._iv_observations: dict[tuple, object] = {}
+
+    def observe_chain(self, chain: pd.DataFrame) -> None:
+        """Collect all contract IV observations independently of entry gates."""
+        for _, row in latest_chain(chain).iterrows():
+            iv = number(row.get("implied_volatility", row.get("iv")))
+            stamp = row.get("timestamp")
+            if iv is None or iv <= 0 or stamp is None or pd.isna(stamp):
+                continue
+            key = (str(row.expiry), float(row.strike), str(row.option_type).upper())
+            if self._iv_observations.get(key) != stamp:
+                self._historical_iv.setdefault(key, []).append(iv)
+                self._historical_iv[key] = self._historical_iv[key][-100:]
+                self._iv_observations[key] = stamp
 
     def extract_strike_quote(
         self,
@@ -289,7 +307,7 @@ class SignalGenerationEngine:
             return None, None, None, None, None
 
         side_str = side.value.upper() if isinstance(side, OptionSide) else str(side).upper()
-        working = option_chain.copy()
+        working = latest_chain(option_chain)
 
         if "strike" in working.columns:
             working = working.loc[pd.to_numeric(working["strike"], errors="coerce") == float(strike)]
@@ -335,7 +353,7 @@ class SignalGenerationEngine:
         """Verify the selected strike spread percentage does not exceed max_spread_percentage (default 0.05)."""
         bid, ask, _, _, _ = self.extract_strike_quote(strike, side, option_chain)
         if bid is None or ask is None:
-            return True, None, None
+            return False, None, "liquidity filter: missing bid/ask"
 
         spread_pct = self.calculate_spread_percentage(bid, ask)
         if spread_pct is None:
@@ -360,46 +378,26 @@ class SignalGenerationEngine:
     ) -> tuple[bool, float | None, float | None, str | None]:
         """Verify implied volatility is below max_implied_volatility_percentile (default 90th percentile)."""
         _, _, current_iv, _, _ = self.extract_strike_quote(strike, side, option_chain)
-        if current_iv is None:
-            return True, None, None, None
-
+        if current_iv is None or current_iv <= 0 or not np.isfinite(current_iv):
+            return False, None, None, "IV percentile unavailable: missing IV"
         side_str = side.value.upper() if isinstance(side, OptionSide) else str(side).upper()
-        key = (float(strike), side_str)
-
-        history: list[float] = []
-        if historical_iv_window is not None:
-            if isinstance(historical_iv_window, pd.Series):
-                history = [float(v) for v in historical_iv_window.dropna().tolist()]
-            else:
-                history = [float(v) for v in historical_iv_window if v is not None and not np.isnan(v)]
-        else:
-            history = list(self._historical_iv.get(key, []))
-
-        # Record current observation in internal rolling window (keep up to 100 observations)
-        buf = self._historical_iv.setdefault(key, [])
-        buf.append(current_iv)
-        if len(buf) > 100:
-            self._historical_iv[key] = buf[-100:]
-
-        if len(history) < 2:
-            return True, current_iv, None, None
-
-        hist_arr = np.array(history, dtype=float)
-        percentile = float(np.mean(hist_arr <= current_iv))
-
-        if (
-            percentile >= self._config.max_implied_volatility_percentile
-            or current_iv >= float(np.percentile(hist_arr, self._config.max_implied_volatility_percentile * 100.0))
-        ):
-            return (
-                False,
-                current_iv,
-                percentile,
-                f"volatility filter: iv {current_iv:.4f} is at {percentile * 100:.1f}th percentile "
-                f"(>= {self._config.max_implied_volatility_percentile * 100:.0f}th percentile) of rolling window - crush risk",
-            )
-
-        return True, current_iv, percentile, None
+        chain = latest_chain(option_chain)
+        rows = chain.loc[(chain.strike == strike) & (chain.option_type == side_str)]
+        expiry = str(rows.iloc[-1].get("expiry", "")) if not rows.empty else ""
+        key = (expiry, float(strike), side_str)
+        history = list(historical_iv_window) if historical_iv_window is not None else list(self._historical_iv.get(key, []))
+        # One observation per provider snapshot, never one per websocket evaluation.
+        observation = rows.iloc[-1].get("timestamp") if not rows.empty else None
+        if observation is not None and pd.notna(observation) and self._iv_observations.get(key) != observation:
+            self._historical_iv.setdefault(key, []).append(current_iv)
+            self._historical_iv[key] = self._historical_iv[key][-100:]
+            self._iv_observations[key] = observation
+        history = [v for v in history if number(v) is not None and v > 0]
+        if len(history) < 20:
+            return False, current_iv, None, "IV percentile warming up: need 20 distinct chain observations"
+        percentile = float(np.mean(np.array(history) <= current_iv))
+        ceiling = min(.5, self._config.max_implied_volatility_percentile)
+        return percentile < ceiling, current_iv, percentile, None if percentile < ceiling else "volatility filter: IV percentile must be below 50"
 
     def _resolve_candidate_strike(
         self,
@@ -447,6 +445,7 @@ class SignalGenerationEngine:
         historical_iv_window: pd.Series | list[float] | None = None,
         snapshot_timestamp: datetime | None = None,
     ) -> SignalResult:
+        self.observe_chain(option_chain if option_chain is not None else pd.DataFrame())
         feature_map = state.feature_snapshot
         close = _safe_float(feature_map.get("close")) or _safe_float(feature_map.get("1m_close"))
         reasons: list[str] = []
@@ -455,7 +454,7 @@ class SignalGenerationEngine:
             reasons.append("confidence below floor")
             return self._neutral_signal(state, regime, probabilities, trap, close, reasons)
 
-        if trap.trap_score >= self._config.trap_cutoff or state.trade_grade == TradeGrade.AVOID:
+        if max(trap.trap_score, state.trap_probability) >= min(.5, self._config.trap_cutoff) or state.trade_grade == TradeGrade.AVOID:
             reasons.append("trap or trade grade filter rejected entry")
             return self._neutral_signal(state, regime, probabilities, trap, close, reasons)
 
@@ -516,17 +515,17 @@ class SignalGenerationEngine:
                 chain = chain.loc[dates == expiry_date.date()]
             if chain.empty or "option_type" not in chain or "strike" not in chain:
                 return reject("OI filter: missing contract chain")
-            _, _, _, call_oi, put_oi = self.extract_strike_quote(candidate_strike.strike, target_side, chain)
-            if (call_oi is None or put_oi is None or not np.isfinite(call_oi)
-                    or not np.isfinite(put_oi) or call_oi <= 0 or put_oi < 0):
-                return reject("OI filter: missing or invalid CE/PE open interest")
-            oi_ratio = put_oi / call_oi
-            if (is_bullish and oi_ratio < 0.8) or (is_bearish and oi_ratio > 1.2):
-                rejected = reject(f"OI imbalance filter: put/call ratio {oi_ratio:.4f} rejects {target_action.value}")
-                rejected.strike_oi_ratio = oi_ratio
-                rejected.days_to_expiry = dte
-                rejected.max_holding_minutes = 15 if dte == 0 else 45
-                return rejected
+            chain = latest_chain(chain)
+            oi_ratio, _ = positioning(chain)
+            if oi_ratio is None or oi_ratio <= 1.5:
+                return reject("Institutional PCR must be greater than 1.5")
+            candidates = enrich_chain(chain, spot=close, now=snapshot_timestamp or state.timestamp)
+            contract = candidates.loc[(candidates.strike == candidate_strike.strike)
+                                      & (candidates.option_type == target_side.value)]
+            delta = number(contract.iloc[-1].get("delta")) if not contract.empty else None
+            if delta is None or not .60 <= abs(delta) <= .80 or (delta > 0) != is_bullish:
+                return reject("Delta selection requires signed Delta magnitude 0.70 +/- 0.10")
+            candidate_strike.delta = delta
 
             if (
                 candidate_strike is not None
@@ -587,6 +586,8 @@ class SignalGenerationEngine:
             sig.days_to_expiry = dte
             sig.max_holding_minutes = 15 if dte == 0 else 45
             sig.strike_oi_ratio = oi_ratio
+            sig.entry_pcr = oi_ratio
+            sig.entry_iv = cur_iv
             return sig
 
         reasons.append("no directional edge")
@@ -673,44 +674,25 @@ class StrikeSelectionEngine:
         self._config = config or StrikeSelectionConfig()
 
     def select(self, state: MarketState, signal: SignalResult, option_chain: pd.DataFrame) -> StrikeResult:
-        feature_map = state.feature_snapshot
-        spot_price = _safe_float(feature_map.get("close")) or _safe_float(feature_map.get("1m_close"))
-        confidence = signal.confidence
+        spot = number(state.feature_snapshot.get("close")) or number(state.feature_snapshot.get("1m_close"))
         side = OptionSide.CE if signal.action in {SignalAction.BUY_CE, SignalAction.SELL_PE} else OptionSide.PE
-        strike_candidates = self._available_strikes(option_chain, side)
-        step = self._infer_step(strike_candidates) if strike_candidates else self._config.default_step
-        expected_move = float(max(1.0, state.quality_score) * step * max(confidence, 0.5))
-
-        if not strike_candidates or spot_price is None:
-            if spot_price is None:
-                return StrikeResult(option_side=side, strike=None, expiry=None, moneyness="unknown", strike_distance=None, expected_move=expected_move, selection_grade=state.trade_grade, rationale=["no spot or strike data"])
-            fallback = round(spot_price / step) * step
-            if confidence >= 0.75 and state.volatility_state in {state.volatility_state.EXPANDING, state.volatility_state.HIGH}:
-                fallback += step if side == OptionSide.CE else -step
-                moneyness = "otm"
-            elif confidence >= 0.70 and state.trade_grade in {TradeGrade.A_PLUS, TradeGrade.A}:
-                moneyness = "itm"
-            else:
-                moneyness = "atm"
-            strike_distance = float((fallback - spot_price) / max(spot_price, 1e-9))
-            return StrikeResult(option_side=side, strike=float(max(fallback, 0.0)), expiry=None, moneyness=moneyness, strike_distance=strike_distance, expected_move=expected_move, selection_grade=state.trade_grade, rationale=["fallback strike from spot"])
-
-        strikes = sorted(strike_candidates)
-        if confidence >= 0.78 and state.trade_grade == TradeGrade.A_PLUS:
-            offset = self._config.aggressive_otm_offset if side == OptionSide.CE else -self._config.aggressive_otm_offset
-            target_strike = spot_price + offset * step if side == OptionSide.CE else spot_price - offset * step
-            moneyness = "otm"
-        elif confidence >= 0.70:
-            target_strike = spot_price
-            moneyness = "atm"
-        else:
-            target_strike = spot_price
-            moneyness = "conservative_atm"
-        chosen = min(strikes, key=lambda strike: abs(strike - target_strike))
-        expiry = self._nearest_expiry(option_chain, state.timestamp)
-        strike_distance = float((chosen - spot_price) / max(spot_price, 1e-9))
-        rationale = [f"selected {moneyness}", f"confidence={confidence:.2f}", f"step={step:.2f}", f"grade={state.trade_grade.value}"]
-        return StrikeResult(option_side=side, strike=float(chosen), expiry=expiry, moneyness=moneyness, strike_distance=strike_distance, expected_move=expected_move, selection_grade=state.trade_grade, rationale=rationale)
+        chain = enrich_chain(option_chain, spot=spot, now=state.timestamp)
+        expiry = self._nearest_expiry(chain, state.timestamp)
+        if not expiry:
+            chain = pd.DataFrame()
+        if not chain.empty and expiry:
+            chain = chain.loc[(chain.option_type == side.value) & (chain.expiry.astype(str) == expiry)]
+            chain = chain.loc[chain.delta.notna() & chain.delta.abs().between(.60, .80)
+                              & ((chain.delta > 0) if side == OptionSide.CE else (chain.delta < 0))]
+        if chain.empty or spot is None:
+            return StrikeResult(option_side=side, strike=None, expiry=expiry, moneyness="unknown",
+                                rationale=["No valid Delta near 0.70; entry suppressed"])
+        row = chain.loc[(chain.delta.abs() - .70).abs().idxmin()]
+        strike = float(row.strike)
+        return StrikeResult(option_side=side, strike=strike, expiry=expiry, delta=float(row.delta),
+                            moneyness="itm" if (strike < spot if side == OptionSide.CE else strike > spot) else "otm",
+                            strike_distance=(strike - spot) / spot, selection_grade=state.trade_grade,
+                            rationale=["Closest absolute Delta to 0.70 within 0.10"])
 
     @staticmethod
     def _available_strikes(option_chain: pd.DataFrame, side: OptionSide) -> list[float]:
@@ -758,8 +740,7 @@ class RiskManagementEngine:
         trade_count_today: int,
         realized_daily_pnl: float,
     ) -> RiskResult:
-        feature_map = state.feature_snapshot
-        close = _safe_float(feature_map.get("close")) or _safe_float(feature_map.get("1m_close")) or 0.0
+        close = signal.entry_reference or 0.0
         if trade_count_today >= self._config.max_trades_per_day:
             return RiskResult(False, 0, None, None, False, "max trades per day reached", partial_exit_fraction=0.0, time_stop_minutes=self._config.time_stop_minutes, position_value=0.0)
 
@@ -771,12 +752,9 @@ class RiskManagementEngine:
             return RiskResult(False, 0, signal.stop_loss, signal.target, False, "state or signal filtered", partial_exit_fraction=0.0, time_stop_minutes=self._config.time_stop_minutes, position_value=0.0)
 
         stop_loss = signal.stop_loss
-        if stop_loss is None and close > 0:
-            stop_loss = close * (0.995 if signal.action == SignalAction.BUY_CE else 1.005)
-
-        target = signal.target
-        if target is None and stop_loss is not None:
-            target = close + 2 * (close - stop_loss) if signal.action == SignalAction.BUY_CE else close - 2 * (stop_loss - close)
+        target = None
+        if not np.isfinite(close) or close <= 0 or stop_loss is None or not np.isfinite(stop_loss) or not 0 < stop_loss < close:
+            return RiskResult(False, 0, stop_loss, None, False, "valid premium ATR stop required")
 
         risk_amount = self._config.capital * self._config.risk_per_trade * max(signal.confidence, 0.35)
         per_unit_risk = abs((close or 1.0) - (stop_loss or close)) * self._config.contract_multiplier
@@ -785,11 +763,11 @@ class RiskManagementEngine:
         quantity = int(max(min(risk_units, max_exposure_units), 0))
 
         if state.trade_grade == TradeGrade.A:
-            quantity = int(max(1, quantity * 0.85))
+            quantity = int(quantity * 0.85)
         elif state.trade_grade == TradeGrade.B:
-            quantity = int(max(1, quantity * 0.65))
+            quantity = int(quantity * 0.65)
         if state.volatility_state.name == "HIGH":
-            quantity = max(1, int(quantity * 0.50))
+            quantity = int(quantity * 0.50)
 
         if quantity < self._config.min_units:
             return RiskResult(False, 0, stop_loss, target, False, "size below minimum", partial_exit_fraction=0.0, time_stop_minutes=self._config.time_stop_minutes, position_value=0.0)

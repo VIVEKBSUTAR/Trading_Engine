@@ -27,3 +27,10 @@ completed source, configuration, tests, and documentation changes to that checko
 as requested by the user, preserving existing local edits. Never mirror .env,
 credentials, runtime data/logs, or Git metadata. Use the canonical checkout for
 commits and pushes after validating the combined changes.
+
+## Permanent market-data source policy
+
+All live snapshots, option chains, and tick feeds must use Fyers API V3. Never
+introduce direct public NSE website requests, cookie/bootstrap scraping, or an
+NSE website fallback. Historical snapshot parsers may remain offline; generic
+API ingestion must reject public NSE hosts and redirects to them.

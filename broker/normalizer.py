@@ -1,4 +1,4 @@
-"""Tick normalization utilities for Kite Connect streaming payloads."""
+"""Tick normalization utilities for Fyers and legacy Kite payloads."""
 
 from __future__ import annotations
 
@@ -190,20 +190,17 @@ class FyersTickNormalizer:
         sym = str(tick.get("symbol") or "")
         token = self._resolve_token(tick, sym)
 
-        ts = (
-            self._normalize_timestamp(tick.get("exch_feed_time"))
-            or self._normalize_timestamp(tick.get("last_traded_time"))
-            or datetime.now(UTC)
-        )
+        # Quote time is the exchange feed time, not the last executed trade.
+        # An unchanged/illiquid contract can have fresh quotes without a new trade.
+        ts = self._normalize_timestamp(tick.get("exch_feed_time")) or datetime.now(UTC)
 
-        lp = _safe_float(tick.get("ltp") or tick.get("last_price") or tick.get("lp"))
-        bid = _safe_float(tick.get("bid_price") or tick.get("bid") or tick.get("bp"))
-        ask = _safe_float(tick.get("ask_price") or tick.get("ask") or tick.get("ap"))
+        def first(*keys: str) -> Any:
+            return next((tick[key] for key in keys if key in tick and tick[key] is not None), None)
 
-        if bid is None and lp is not None and lp > 0:
-            bid = round(lp * 0.998, 2)
-        if ask is None and lp is not None and lp > 0:
-            ask = round(lp * 1.002, 2)
+        lp = _safe_float(first("ltp", "last_price", "lp"))
+        bid = _safe_float(first("bid_price", "bid", "bp"))
+        ask = _safe_float(first("ask_price", "ask", "ap"))
+        # Never invent executable prices from LTP when bid/ask are absent.
 
         return {
             "timestamp": ts,
@@ -212,7 +209,7 @@ class FyersTickNormalizer:
             "last_price": lp,
             "bid_price": bid,
             "ask_price": ask,
-            "volume_traded": _safe_float(tick.get("vol_traded_today") or tick.get("volume")),
+            "volume_traded": _safe_float(first("vol_traded_today", "volume", "vol", "volume_traded")),
             "total_buy_quantity": _safe_float(tick.get("tot_buy_qty") or tick.get("bid_size")),
             "total_sell_quantity": _safe_float(tick.get("tot_sell_qty") or tick.get("ask_size")),
             "average_traded_price": _safe_float(tick.get("avg_trade_price") or tick.get("atp")),
@@ -273,9 +270,10 @@ class FyersTickNormalizer:
     def _normalize_timestamp(value: Any) -> pd.Timestamp | None:
         if value is None:
             return None
-        if isinstance(value, (int, float)):
-            ts = value / 1000.0 if value > 1e11 else float(value)
-            return pd.to_datetime(ts, unit="s", utc=True)
+        if isinstance(value, (int, float)) or (isinstance(value, str) and value.strip().replace(".", "", 1).isdigit()):
+            number = float(value)
+            ts = number / 1000.0 if number > 1e11 else number
+            return pd.to_datetime(ts, unit="s", utc=True, errors="coerce")
         ts = pd.to_datetime(value, errors="coerce", utc=True)
         if pd.isna(ts):
             return None

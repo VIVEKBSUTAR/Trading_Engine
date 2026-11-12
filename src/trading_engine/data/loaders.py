@@ -7,7 +7,8 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
-from urllib.request import Request, urlopen
+from urllib.parse import urlsplit
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 import pandas as pd
 
@@ -15,6 +16,20 @@ from trading_engine.common.exceptions import DataIngestionError
 from trading_engine.common.logging import get_logger
 
 SourceType = Literal["csv", "api"]
+
+
+def _reject_public_nse(url: str) -> None:
+    host = (urlsplit(url).hostname or "").rstrip(".").lower()
+    if host == "nseindia.com" or host.endswith(".nseindia.com"):
+        raise DataIngestionError("Direct NSE website ingestion is disabled; use the Fyers broker pipeline")
+
+
+class _NoPublicNSERedirectHandler(HTTPRedirectHandler):
+    """Do not let a historical API URL redirect into the retired website feed."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        _reject_public_nse(newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
 @dataclass(slots=True)
@@ -74,11 +89,13 @@ class AsyncFeedLoader:
         return frame
 
     async def _load_api(self, url: str) -> pd.DataFrame:
+        _reject_public_nse(url)
         self._logger.info("Loading API feed", url=url)
 
         def _fetch() -> dict[str, Any] | list[dict[str, Any]]:
             request = Request(url, headers={"User-Agent": "trading-engine/0.1"})
-            with urlopen(request, timeout=self._timeout_seconds) as response:  # noqa: S310
+            opener = build_opener(_NoPublicNSERedirectHandler())
+            with opener.open(request, timeout=self._timeout_seconds) as response:
                 body = response.read().decode("utf-8")
             return json.loads(body)
 
